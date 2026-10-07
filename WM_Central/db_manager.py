@@ -67,12 +67,41 @@ def get_operarios():
     conn.close()
     return filas
 
+
+#comprueba si la estación y la ubicación existen en la base de datos
+def autenticar_estacion(ws_id, ubicacion):
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    cursor.execute("SELECT id FROM estaciones WHERE id = ? AND ubicacion = ?", (ws_id, ubicacion))
+    fila = cursor.fetchone() #recupera la primera coincidencia tanto en identificador como en nombre de ubicación
+    conn.close()
+    return fila is not None #si no existe o la ubicación no ccoincide devuelve false
+
+#actualiza el estado de una estación en SQLite
+def actualizar_estado_estacion(ws_id, nuevo_estado):
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    cursor.execute("UPDATE estaciones SET estado = ? WHERE id = ?", (nuevo_estado, ws_id))
+    conn.commit()
+    conn.close()
+
 if __name__ == "__main__":
     init_db()
-    print("\n--- Estaciones registradas ---")
+    
+    print("\n--- PRUEBA 1: Autenticación ---")
+    ok = autenticar_estacion("WS-01", "River Park")
+    fail = autenticar_estacion("WS-01", "Ubicacion Falsa")
+    print(f"Prueba WS-01 con 'River Park' (debe dar True): {ok}")
+    print(f"Prueba WS-01 con 'Ubicacion Falsa' (debe dar False): {fail}")
+    
+    print("\n--- PRUEBA 2: Actualización de estado ---")
+    print("Cambiando WS-01 a DISPONIBLE...")
+    actualizar_estado_estacion("WS-01", "DISPONIBLE")
+    
     for est in get_estaciones():
-        print(f"ID: {est[0]} | Ubicacion: {est[1]} | Estado: {est[2]}")
-        
-    print("\n--- Operarios registrados ---")
-    for op in get_operarios():
-        print(f"ID: {op[0]} | Nombre: {op[1]}")
+        if est[0] == "WS-01":
+            print(f"Nuevo estado en BD para WS-01: {est[2]} (debe ser DISPONIBLE)")
+            
+    # Restauramos a DESCONECTADA para dejarlo limpio
+    actualizar_estado_estacion("WS-01", "DESCONECTADA")
+    print("Estado restaurado a DESCONECTADA.")
