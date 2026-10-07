@@ -3,17 +3,12 @@
 # - aceptar conexiones simultáneas de múltiples estaciones de riego (WM_WS_M)
 # - autenticarlas usando la base de datos SQLite
 # - Reaccionar de inmediato si alguna se avería
-# - (Kafka) recibir las peticiones de riego de los operarios, validar que la estación
-#   esté disponible, ordenar la apertura al Engine, responder al operario y enviarle
-#   el resumen final del riego
 import sys
 import json
 import time
 import uuid
 import socket
 import threading
-from kafka import KafkaProducer, KafkaConsumer
-from kafka.errors import NoBrokersAvailable
 from db_manager import *
 
 ENQ = b'\x05'   # Solicitud inicial
@@ -22,22 +17,22 @@ NACK = b'\x15'  # Error / No reconocido
 
 #cada vez que un Monitor se conecta a la central el servidor principal geenera un hilo que ejecuta la funciòn exclusiva para esa conexión
 def handle_monitor_client(client_socket, client_address):
-    ws_id = None
+    ws_id = None 
     print(f"\n[CENTRAL] Conexión TCP entrante desde {client_address}") #client address--> tupla de la IP y puerto
     try:
         # 1. Handshake inicial
         data = client_socket.recv(1024)#hilo se pausa hasta que llegan bytes por la red
-        if data != ENQ:
+        if data != ENQ: 
             print(f"[CENTRAL] Byte recibido incorrecto ({data}). Enviando <NACK>...")
             client_socket.sendall(NACK)
             return
-
+        
         client_socket.sendall(ACK)
         print(f"[CENTRAL] Handshake superado con {client_address}. Esperando registro...")
 
         # convierte los bytes entrantes en texto legible mediante 'decode'
         reg_data = client_socket.recv(1024).decode('utf-8').strip()
-        #cada vez que nos envíemos datos separaremos cada dato con una almohadilla
+        #'cada vez que nos envíemos datos separaremos cada dato con una almohadilla
         partes = reg_data.split("#")
 
         if len(partes) == 3 and partes[0] == "REG":
@@ -62,7 +57,7 @@ def handle_monitor_client(client_socket, client_address):
             msg = client_socket.recv(1024)
             if not msg:
                 break
-
+            
             texto = msg.decode('utf-8').strip()
             if texto == "ALERT#FUGA":
                 actualizar_estado_estacion(ws_id, "AVERIADA")
@@ -70,24 +65,35 @@ def handle_monitor_client(client_socket, client_address):
 
     except Exception as e:
         print(f"[CENTRAL] Incidencia con {ws_id or client_address}: {e}")
+        print(f"[CENTRAL] Incidencia con {ws_id or client_address}: {e}")
     finally:
         if ws_id:
             actualizar_estado_estacion(ws_id, "DESCONECTADA")
             print(f"[CENTRAL] Estación {ws_id} desconectada -> Estado: DESCONECTADA\n")
+        if ws_id:
+            actualizar_estado_estacion(ws_id, "DESCONECTADA")
+            print(f"[CENTRAL] Estación {ws_id} desconectada -> Estado: DESCONECTADA\n")
         client_socket.close()
+    
 
 
-
-#esta función se ejecuta en un hilo independiente y se encarga de escuchar las conexiones entrantes de los monitores
+#actúa como recepcionista de la central, su propósito es poner en marcha el servidor de red, quedarse esperando llamadas entrantes de los monitores
+#de ruefi (WM_WS_M) y derivar cada conexión a un hilo independiente
 def start_socket_server(port):
     #crea el objeto de socket de red
+    #crea el objeto de socket de red
     server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    #activa la reutilización automática del puerto local.
+    #aunque hagas contro + C y lo vuelvas a usar inmediatamente
     #activa la reutilización automática del puerto local.
     #aunque hagas contro + C y lo vuelvas a usar inmediatamente
     server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
 
     #enlaza el socket a una interfaz física y a un puerto. Al poner 0.0.0.0 le ordena que escuche en todas las tarjetas e interfaces de red del equipo
+
+    #enlaza el socket a una interfaz física y a un puerto. Al poner 0.0.0.0 le ordena que escuche en todas las tarjetas e interfaces de red del equipo
     server.bind(("0.0.0.0", port))
+    #pone el socket en modo de escucha pasiva
     #pone el socket en modo de escucha pasiva
     server.listen(5)
     print(f"[CENTRAL] Servidor de Sockets a la escucha en el puerto {port}...")
@@ -95,9 +101,12 @@ def start_socket_server(port):
     while True:
         client_sock, addr = server.accept()
         #cre un nuevo hilo de ejecución en paralelo
+        #cre un nuevo hilo de ejecución en paralelo
         thread = threading.Thread(target=handle_monitor_client, args=(client_sock, addr))
         #hilo en segundo plano(demonio), todos los hilos creados se destruyen al instante  sin dejar procesos huérfanos
+        #hilo en segundo plano(demonio), todos los hilos creados se destruyen al instante  sin dejar procesos huérfanos
         thread.daemon = True
+        #arranca el hilo
         #arranca el hilo
         thread.start()
 

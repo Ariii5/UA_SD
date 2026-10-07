@@ -85,25 +85,6 @@ def actualizar_estado_estacion(ws_id, nuevo_estado):
     conn.commit()
     conn.close()
 
-#consultas para la coordinación de riego por Kafka ---
-def get_estado_estacion(ws_id):
-    """Devuelve el estado de la estación, o None si no existe."""
-    conn = sqlite3.connect(DB_PATH)
-    cursor = conn.cursor()
-    cursor.execute("SELECT estado FROM estaciones WHERE id = ?", (ws_id,))
-    fila = cursor.fetchone()
-    conn.close()
-    return fila[0] if fila else None
-
-def existe_operario(op_id):
-    """True si el operario está dado de alta en la BD."""
-    conn = sqlite3.connect(DB_PATH)
-    cursor = conn.cursor()
-    cursor.execute("SELECT id FROM operarios WHERE id = ?", (op_id,))
-    fila = cursor.fetchone()
-    conn.close()
-    return fila is not None
-
 if __name__ == "__main__":
     init_db()
     
@@ -117,7 +98,24 @@ if __name__ == "__main__":
     print("Cambiando WS-01 a DISPONIBLE...")
     actualizar_estado_estacion("WS-01", "DISPONIBLE")
     
+    
+    print("\n--- PRUEBA 1: Autenticación ---")
+    ok = autenticar_estacion("WS-01", "River Park")
+    fail = autenticar_estacion("WS-01", "Ubicacion Falsa")
+    print(f"Prueba WS-01 con 'River Park' (debe dar True): {ok}")
+    print(f"Prueba WS-01 con 'Ubicacion Falsa' (debe dar False): {fail}")
+    
+    print("\n--- PRUEBA 2: Actualización de estado ---")
+    print("Cambiando WS-01 a DISPONIBLE...")
+    actualizar_estado_estacion("WS-01", "DISPONIBLE")
+    
     for est in get_estaciones():
+        if est[0] == "WS-01":
+            print(f"Nuevo estado en BD para WS-01: {est[2]} (debe ser DISPONIBLE)")
+            
+    # Restauramos a DESCONECTADA para dejarlo limpio
+    actualizar_estado_estacion("WS-01", "DESCONECTADA")
+    print("Estado restaurado a DESCONECTADA.")
         if est[0] == "WS-01":
             print(f"Nuevo estado en BD para WS-01: {est[2]} (debe ser DISPONIBLE)")
             
