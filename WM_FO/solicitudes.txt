@@ -1,0 +1,6 @@
+# Peticiones de riego para el modo automático de WM_FO
+# Formato: <ID_ESTACION>,<DURACION_EN_SEGUNDOS>
+WS-01,8
+WS-02,5
+WS-99,5
+WS-01,6
