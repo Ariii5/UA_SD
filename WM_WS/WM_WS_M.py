@@ -50,6 +50,7 @@ def health_pulse_worker(engine_socket, ws_id):
 def handle_engine_connection(engine_socket, engine_address, ws_id):
 
     print(f"[{ws_id} - SERVIDOR] Engine conectado desde {engine_address}")
+    engine_socket.sendall(f"ID#{ws_id}".encode("utf-8")) #antes de iniciar el pulso de salud, le enviamos nuestro identificador para saber quien es
     # Lanzamos el vigilante de salud en un hilo independiente
     t_health = threading.Thread(target=health_pulse_worker, args=(engine_socket, ws_id), daemon=True)
     t_health.start()

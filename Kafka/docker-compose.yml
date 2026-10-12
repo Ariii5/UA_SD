@@ -21,3 +21,9 @@ services:
       KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
       KAFKA_LOG_DIRS: /tmp/kraft-combined-logs
       CLUSTER_ID: "gTBb85_WRXu6oQgq-brTQw"
+
+# Red con nombre fijo para que los contenedores WM_* se unan a ella (--network wm_net)
+# y lleguen al broker como broker:29092
+networks:
+  default:
+    name: wm_net
