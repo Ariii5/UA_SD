@@ -1,0 +1,9 @@
+# Bytecode que genera Python automáticamente
+__pycache__/
+*.pyc
+
+# Base de datos local (Central la crea sola al arrancar)
+*.db
+
+# Basura de macOS
+.DS_Store

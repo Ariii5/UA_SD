@@ -131,7 +131,8 @@ def solicitar_riego(ws_id, duracion):
                 print(f"   Duración : {m.get('duracion')} s")
                 print(f"   Litros   : {m.get('litros')} l")
                 print("   ================================")
-                return m.get("motivo") != "FUGA"
+                # Fuga o pérdida de la estación = servicio fallido
+                return m.get("motivo") not in ("FUGA", "SIN_NOTICIAS_ESTACION")
     finally:
         riego_activo.update(req_id=None, ws_id=None)
 

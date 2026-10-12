@@ -3,12 +3,17 @@
 # - aceptar conexiones simultáneas de múltiples estaciones de riego (WM_WS_M)
 # - autenticarlas usando la base de datos SQLite
 # - Reaccionar de inmediato si alguna se avería
+# - (Kafka) recibir las peticiones de riego de los operarios, validar que la estación
+#   esté disponible, ordenar la apertura al Engine, responder al operario y enviarle
+#   el resumen final del riego
 import sys
 import json
 import time
 import uuid
 import socket
 import threading
+from kafka import KafkaProducer, KafkaConsumer
+from kafka.errors import NoBrokersAvailable
 from db_manager import *
 
 ENQ = b'\x05'   # Solicitud inicial
@@ -17,16 +22,16 @@ NACK = b'\x15'  # Error / No reconocido
 
 #cada vez que un Monitor se conecta a la central el servidor principal geenera un hilo que ejecuta la funciòn exclusiva para esa conexión
 def handle_monitor_client(client_socket, client_address):
-    ws_id = None 
+    ws_id = None
     print(f"\n[CENTRAL] Conexión TCP entrante desde {client_address}") #client address--> tupla de la IP y puerto
     try:
         # 1. Handshake inicial
         data = client_socket.recv(1024)#hilo se pausa hasta que llegan bytes por la red
-        if data != ENQ: 
+        if data != ENQ:
             print(f"[CENTRAL] Byte recibido incorrecto ({data}). Enviando <NACK>...")
             client_socket.sendall(NACK)
             return
-        
+
         client_socket.sendall(ACK)
         print(f"[CENTRAL] Handshake superado con {client_address}. Esperando registro...")
 
@@ -57,7 +62,7 @@ def handle_monitor_client(client_socket, client_address):
             msg = client_socket.recv(1024)
             if not msg:
                 break
-            
+
             texto = msg.decode('utf-8').strip()
             if texto == "ALERT#FUGA":
                 actualizar_estado_estacion(ws_id, "AVERIADA")
@@ -65,35 +70,25 @@ def handle_monitor_client(client_socket, client_address):
 
     except Exception as e:
         print(f"[CENTRAL] Incidencia con {ws_id or client_address}: {e}")
-        print(f"[CENTRAL] Incidencia con {ws_id or client_address}: {e}")
     finally:
         if ws_id:
             actualizar_estado_estacion(ws_id, "DESCONECTADA")
             print(f"[CENTRAL] Estación {ws_id} desconectada -> Estado: DESCONECTADA\n")
-        if ws_id:
-            actualizar_estado_estacion(ws_id, "DESCONECTADA")
-            print(f"[CENTRAL] Estación {ws_id} desconectada -> Estado: DESCONECTADA\n")
         client_socket.close()
-    
+
 
 
 #actúa como recepcionista de la central, su propósito es poner en marcha el servidor de red, quedarse esperando llamadas entrantes de los monitores
 #de ruefi (WM_WS_M) y derivar cada conexión a un hilo independiente
 def start_socket_server(port):
     #crea el objeto de socket de red
-    #crea el objeto de socket de red
     server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    #activa la reutilización automática del puerto local.
-    #aunque hagas contro + C y lo vuelvas a usar inmediatamente
     #activa la reutilización automática del puerto local.
     #aunque hagas contro + C y lo vuelvas a usar inmediatamente
     server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
 
     #enlaza el socket a una interfaz física y a un puerto. Al poner 0.0.0.0 le ordena que escuche en todas las tarjetas e interfaces de red del equipo
-
-    #enlaza el socket a una interfaz física y a un puerto. Al poner 0.0.0.0 le ordena que escuche en todas las tarjetas e interfaces de red del equipo
     server.bind(("0.0.0.0", port))
-    #pone el socket en modo de escucha pasiva
     #pone el socket en modo de escucha pasiva
     server.listen(5)
     print(f"[CENTRAL] Servidor de Sockets a la escucha en el puerto {port}...")
@@ -101,24 +96,25 @@ def start_socket_server(port):
     while True:
         client_sock, addr = server.accept()
         #cre un nuevo hilo de ejecución en paralelo
-        #cre un nuevo hilo de ejecución en paralelo
         thread = threading.Thread(target=handle_monitor_client, args=(client_sock, addr))
         #hilo en segundo plano(demonio), todos los hilos creados se destruyen al instante  sin dejar procesos huérfanos
-        #hilo en segundo plano(demonio), todos los hilos creados se destruyen al instante  sin dejar procesos huérfanos
         thread.daemon = True
-        #arranca el hilo
         #arranca el hilo
         thread.start()
 
 
-#coordinación de riego con kafka: peticiones de riego, órdenes a los Engines, telemetría y resúmenes finales
+# ==============================================================================
+# COORDINACIÓN DE RIEGO POR KAFKA (Ariadna - semana 3)
+# ==============================================================================
+# Topics (deben llamarse igual en WM_FO y WM_WS_E)
 TOPIC_SOLICITUDES = "wm_solicitudes"   # Operario/estación -> CENTRAL : SOLICITUD, LISTAR
 TOPIC_RESPUESTAS = "wm_respuestas"     # CENTRAL -> Operario         : INFO, AUTORIZADO, DENEGADO, RESUMEN, LISTADO
 TOPIC_ORDENES = "wm_ordenes"           # CENTRAL -> Engine           : ABRIR, CERRAR
 TOPIC_TELEMETRIA = "wm_telemetria"     # Engine -> CENTRAL/Operario  : INICIO, TELEMETRIA, FIN, RECHAZO
 
-TIMEOUT_APERTURA = 5    # segundos que esperamos a que el Engine confirme la apertura (INICIO)
-MAX_ANTIGUEDAD = 30     # peticiones más viejas se descartan (p.ej. Central estaba caída)
+TIMEOUT_APERTURA = 5    # s que esperamos a que el Engine confirme la apertura (INICIO)
+TIMEOUT_SIN_NOTICIAS = 8  # s sin telemetría de un riego en curso -> se da por terminado
+MAX_ANTIGUEDAD = 30     # s: peticiones más viejas se descartan (p.ej. Central estaba caída)
 
 producer = None
 lock_riegos = threading.Lock()
@@ -147,7 +143,7 @@ def denegar(sol, motivo):
     responder_operario("DENEGADO", sol, motivo)
 
 
-# 1. Peticiones que llegan de los operarios
+# ---------- 1. Peticiones que llegan de los operarios ----------
 def procesar_solicitud(sol):
     op_id = sol.get("op_id")
     ws_id = sol.get("ws_id")
@@ -183,7 +179,7 @@ def procesar_listado(sol):
     responder_operario("LISTADO", sol, "Estado de las estaciones", estaciones=estaciones)
 
 
-#Eventos que llegan de los Engines
+# ---------- 2. Eventos que llegan de los Engines ----------
 def procesar_evento_ws(ev):
     tipo = ev.get("tipo")
     ws_id = ev.get("ws_id")
@@ -196,7 +192,7 @@ def procesar_evento_ws(ev):
             del pendientes[ws_id]
             activos[ws_id] = {"req_id": ev.get("req_id"), "op_id": ev.get("op_id"),
                               "caudal": 0.0, "volumen": 0.0, "transcurrido": 0.0,
-                              "sol": pend["sol"]}
+                              "ultimo": time.time(), "sol": pend["sol"]}
         actualizar_estado_estacion(ws_id, "REGANDO")
         print(f"[CENTRAL-RIEGO] {ws_id} REGANDO para {ev.get('op_id')}")
         responder_operario("AUTORIZADO", pend["sol"],
@@ -215,12 +211,16 @@ def procesar_evento_ws(ev):
                 act["caudal"] = ev.get("caudal")
                 act["volumen"] = ev.get("volumen")
                 act["transcurrido"] = ev.get("transcurrido")
+                act["ultimo"] = time.time()   # última vez que supimos de este riego
         print(f"[CENTRAL-RIEGO] {ws_id} | {ev.get('caudal'):5.2f} l/min | "
               f"{ev.get('volumen'):7.2f} l | operario {ev.get('op_id')}")
 
     elif tipo == "FIN":
         with lock_riegos:
-            act = activos.pop(ws_id, None)
+            act = activos.get(ws_id)
+            if act and act["req_id"] != ev.get("req_id"):
+                return   # FIN atrasado de un riego anterior: no debe cerrar el riego actual
+            activos.pop(ws_id, None)
             pendientes.pop(ws_id, None)
         motivo = ev.get("motivo")
         # Estado final: fuga -> AVERIADA; si seguía REGANDO -> vuelve a DISPONIBLE.
@@ -238,7 +238,10 @@ def procesar_evento_ws(ev):
 
 
 def vigilar_timeouts():
-    """Si un Engine no confirma la apertura en TIMEOUT_APERTURA s, se deniega y se libera."""
+    """Vigila dos cosas cada segundo:
+    - Si un Engine no confirma la apertura en TIMEOUT_APERTURA s -> se deniega y se libera.
+    - Si de un riego en curso no llega nada en TIMEOUT_SIN_NOTICIAS s (Engine caído o FIN
+      perdido) -> se da por terminado. Si no, la estación quedaría "ocupada" para siempre."""
     while True:
         time.sleep(1)
         ahora = time.time()
@@ -247,11 +250,22 @@ def vigilar_timeouts():
                          if ahora - p["enviado"] > TIMEOUT_APERTURA]
             for ws, _ in caducados:
                 del pendientes[ws]
+            perdidos = [(ws, a) for ws, a in activos.items()
+                        if ahora - a["ultimo"] > TIMEOUT_SIN_NOTICIAS]
+            for ws, _ in perdidos:
+                del activos[ws]
         for ws, p in caducados:
             denegar(p["sol"], f"{ws} no ha respondido a la orden de apertura")
+        for ws, a in perdidos:
+            if get_estado_estacion(ws) == "REGANDO":
+                actualizar_estado_estacion(ws, "DISPONIBLE")
+            print(f"[CENTRAL-RIEGO] {ws}: sin noticias del riego en {TIMEOUT_SIN_NOTICIAS}s. Se da por terminado.")
+            responder_operario("RESUMEN", a["sol"], f"Sin noticias de {ws}: riego dado por terminado",
+                               motivo="SIN_NOTICIAS_ESTACION",
+                               duracion=a["transcurrido"], litros=a["volumen"])
 
 
-#bucle consumidor
+# ---------- 3. Bucle consumidor ----------
 def bucle_kafka(broker):
     # Un único consumidor para peticiones y telemetría: todas las decisiones se toman
     # en un solo hilo y en orden, así dos peticiones a la misma estación no se cruzan.
@@ -315,7 +329,7 @@ def iniciar_kafka(broker):
     threading.Thread(target=vigilar_timeouts, daemon=True).start()
 
 
-#Funciones para el panel y la administración
+# ---------- 4. Funciones para el panel y la administración (las usará Sara) ----------
 def forzar_riego(ws_id, duracion=30):
     """Opción 'Iniciar un riego' de CENTRAL: se comporta igual que si lo pidiera un operario."""
     enviar(TOPIC_SOLICITUDES, {"tipo": "SOLICITUD", "req_id": f"CEN-{uuid.uuid4().hex[:8]}",
@@ -324,14 +338,15 @@ def forzar_riego(ws_id, duracion=30):
 
 
 def ordenar_cierre(ws_id, motivo="ORDEN_CENTRAL"):
-    """Corta el riego en curso de una estación"""
+    """Corta el riego en curso de una estación (p.ej. al bloquearla)."""
     enviar(TOPIC_ORDENES, {"tipo": "CERRAR", "ws_id": ws_id, "motivo": motivo}, clave=ws_id)
 
 
 def obtener_telemetria():
     """Riegos en curso {ws_id: {caudal, volumen, op_id, ...}} para pintarlos en el panel."""
     with lock_riegos:
-        return {ws: {k: v for k, v in d.items() if k != "sol"} for ws, d in activos.items()}
+        return {ws: {k: v for k, v in d.items() if k not in ("sol", "ultimo")}
+                for ws, d in activos.items()}
 
 
 if __name__ == "__main__":

@@ -1,61 +1,3 @@
-#Misión:
-# - Responder OK a los chequeos periódicos de salud (HEALTH?)
-# - Simular una avería
-import sys
-import socket
-import threading
-
-simular_fuga = False
-
-def keyboard_listener():
-    """Escucha la pulsación de teclas en la terminal."""
-    global simular_fuga
-    while True:
-        cmd = input()
-        if cmd.strip().lower() == 'k':
-            simular_fuga = True
-            print("\n[ENGINE] ¡FALLO FORZADO! En el próximo pulso de salud se enviará 'KO'...\n")
-
-if __name__ == "__main__":
-    if len(sys.argv) < 3:
-        print("Uso: python3 WM_WS_E.py <ip_monitor> <puerto_monitor>")
-        print("Ejemplo: python3 WM_WS_E.py 127.0.0.1 5001")
-        sys.exit(1)
-
-    ip_monitor = sys.argv[1]
-    puerto_monitor = int(sys.argv[2])
-
-    print("=" * 50)
-    print("      SIMULADOR DEL MOTOR (WM_WS_E)")
-    print("=" * 50)
-
-    try:
-        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        sock.connect((ip_monitor, puerto_monitor))
-        print(f"[ENGINE] Conectado al Monitor en {ip_monitor}:{puerto_monitor}")
-        print("[ENGINE] Respondiendo 'OK' a los pulsos de salud.")
-        print("[ENGINE] >> Escribe 'k' y pulsa Enter para forzar una avería <<\n")
-
-        # Hilo para leer el teclado en paralelo
-        threading.Thread(target=keyboard_listener, daemon=True).start()
-
-        while True:
-            data = sock.recv(1024)
-            if not data:
-                break
-            
-            if data == b"HEALTH?":
-                if simular_fuga:
-                    sock.sendall(b"KO")
-                    print("[ENGINE] Enviado: KO -> Avería reportada.")
-                else:
-                    sock.sendall(b"OK")
-    except ConnectionRefusedError:
-        print(f"[ENGINE] Error: El Monitor no está escuchando en {ip_monitor}:{puerto_monitor}")
-    except Exception as e:
-        print(f"[ENGINE] Desconexión: {e}")
-    finally:
-        sock.close()
 # WM_WS_E.py - Engine de la estación de riego
 # Misión:
 # - Responder OK/KO a los chequeos periódicos de salud (HEALTH?) del Monitor
@@ -100,7 +42,7 @@ def publicar(topic, mensaje):
         print(f"[ENGINE] Error publicando en Kafka: {e}")
 
 
-#electrovalvula y caudalímetro 
+# ---------------- ELECTROVÁLVULA + CAUDALÍMETRO ----------------
 CAUDAL_NOMINAL = 12.0   # litros/minuto con la válvula abierta
 
 lock = threading.Lock()  # protege 'riego', que lo tocan varios hilos
@@ -151,7 +93,12 @@ def cerrar_valvula(motivo):
     publicar(TOPIC_TELEMETRIA, {"tipo": "FIN", "motivo": motivo,
                                 "duracion": duracion, "litros": litros,
                                 "op_id": op_id, "req_id": req_id})
-    producer.flush(timeout=3)   # obliga a enviar ya lo pendiente: el FIN no se puede perder
+    try:
+        producer.flush(timeout=3)   # obliga a enviar ya lo pendiente: el FIN no se puede perder
+    except Exception:
+        # Kafka va lento: el FIN sigue en la cola del productor y se enviará en cuanto se pueda.
+        # NO dejamos que el error rompa el hilo (antes esto tumbaba el caudalímetro).
+        print("[ENGINE] Aviso: Kafka tarda en confirmar el FIN; se reintentará automáticamente.")
 
 
 def bucle_caudalimetro():
@@ -180,7 +127,7 @@ def bucle_caudalimetro():
             return
 
 
-#lo que entra del teclado
+# ---------------- TECLADO ----------------
 def keyboard_listener():
     """Escucha la pulsación de teclas en la terminal."""
     global simular_fuga
@@ -202,13 +149,12 @@ def keyboard_listener():
                                          "req_id": f"MAN-{ws_id}-{int(time.time())}",
                                          "op_id": f"MANUAL-{ws_id}",
                                          "duracion": duracion})
-            producer.flush(timeout=3)
             print(f"[ENGINE] Petición de riego manual ({duracion}s) enviada a CENTRAL...")
         elif cmd == 'p':
             cerrar_valvula("PARADA_MANUAL")
 
 
-#ordenes kafka
+# ---------------- ÓRDENES DE CENTRAL POR KAFKA ----------------
 def escuchar_ordenes(broker):
     """Hilo consumidor: obedece las órdenes para esta estación y muestra las
     respuestas de CENTRAL a los riegos manuales pedidos desde aquí."""
@@ -253,7 +199,7 @@ def procesar_orden(orden):
         cerrar_valvula(orden.get("motivo", "ORDEN_CENTRAL"))
 
 
-#cierre de ventana
+# ---------------- CIERRE DE LA VENTANA ----------------
 def instalar_cierre_ventana():
     """Hace que, si se cierra la ventana (la X) o se mata el proceso, se cierre
     la electroválvula y se publique el FIN antes de morir."""
@@ -285,7 +231,7 @@ def instalar_cierre_ventana():
         signal.signal(signal.SIGTERM, manejador_senal)
 
 
-
+# ---------------- PROGRAMA PRINCIPAL ----------------
 if __name__ == "__main__":
     if len(sys.argv) < 4:
         print("Uso: py WM_WS_E.py <ip_broker:puerto> <ip_monitor> <puerto_monitor>")
@@ -362,4 +308,8 @@ if __name__ == "__main__":
     finally:
         if producer:
             cerrar_valvula("PROCESO_DETENIDO")   # nunca dejar el agua corriendo al salir
+            try:
+                producer.close(timeout=3)        # envía lo pendiente y suelta la conexión con Kafka
+            except Exception:
+                pass
         sock.close()
