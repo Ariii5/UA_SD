@@ -5,6 +5,9 @@ ENV PYTHONUNBUFFERED=1
 
 WORKDIR /app
 
+# Librería de Kafka (coordinación de riego)
+RUN pip install --no-cache-dir kafka-python==2.2.15
+
 # Copiar scripts del módulo central
 COPY db_manager.py .
 COPY WM_Central.py .

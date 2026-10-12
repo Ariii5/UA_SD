@@ -85,6 +85,25 @@ def actualizar_estado_estacion(ws_id, nuevo_estado):
     conn.commit()
     conn.close()
 
+# --- Añadido semana 3 (Ariadna): consultas para la coordinación de riego por Kafka ---
+def get_estado_estacion(ws_id):
+    """Devuelve el estado de la estación, o None si no existe."""
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    cursor.execute("SELECT estado FROM estaciones WHERE id = ?", (ws_id,))
+    fila = cursor.fetchone()
+    conn.close()
+    return fila[0] if fila else None
+
+def existe_operario(op_id):
+    """True si el operario está dado de alta en la BD."""
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    cursor.execute("SELECT id FROM operarios WHERE id = ?", (op_id,))
+    fila = cursor.fetchone()
+    conn.close()
+    return fila is not None
+
 if __name__ == "__main__":
     init_db()
     

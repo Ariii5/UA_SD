@@ -1,29 +1,253 @@
+# WM_FO.py - Aplicación del operario de campo (Field Operator)
+# - Modo interactivo: menú por consola para pedir riegos y ver estaciones
+# - Modo fichero: lee las peticiones de un .txt, las lanza de una en una y, al
+#   concluir cada servicio (éxito o fracaso), espera 4 segundos antes de la siguiente
+#
+# Uso:
+#   py WM_FO.py --broker localhost:9092 --id FO-01
+#   py WM_FO.py --broker localhost:9092 --id FO-01 --fichero solicitudes.txt
+#
+# Formato del fichero (una petición por línea; las líneas vacías o que empiezan por # se ignoran):
+#   <ID_ESTACION>,<DURACION_EN_SEGUNDOS>
+#   WS-01,15
+import sys
+import json
+import time
+import uuid
+import queue
 import argparse
-from kafka import KafkaProducer
+import threading
 
+from kafka import KafkaProducer, KafkaConsumer
+from kafka.errors import NoBrokersAvailable
+
+TOPIC_SOLICITUDES = "wm_solicitudes"   # FO -> CENTRAL
+TOPIC_RESPUESTAS = "wm_respuestas"     # CENTRAL -> FO
+TOPIC_TELEMETRIA = "wm_telemetria"     # WS_E -> CENTRAL/FO
+
+ESPERA_ENTRE_SERVICIOS = 4      # s (lo exige el enunciado en el modo fichero)
+TIMEOUT_RESPUESTA = 15          # s sin noticias de CENTRAL antes de autorizar -> fracaso
+TIMEOUT_TELEMETRIA = 10         # s sin telemetría durante un riego -> fracaso
+
+op_id = None
+producer = None
+bandeja = queue.Queue()         # mensajes relevantes para este operario
+riego_activo = {"req_id": None, "ws_id": None}   # para filtrar la telemetría
+
+
+# ===========================================================================
+# KAFKA
+# ===========================================================================
+def crear_consumidor(broker):
+    """Cada operario usa un group_id ÚNICO: así recibe todos los mensajes del topic
+    (si dos FO compartieran grupo, Kafka repartiría los mensajes entre ellos)."""
+    consumer = KafkaConsumer(
+        bootstrap_servers=[broker],
+        group_id=f"wm_fo_{op_id}_{uuid.uuid4().hex[:6]}",
+        auto_offset_reset="latest",
+        metadata_max_age_ms=3000,       # detectar pronto los topics si se crean después
+        value_deserializer=lambda b: json.loads(b.decode("utf-8")),
+    )
+    consumer.subscribe([TOPIC_RESPUESTAS, TOPIC_TELEMETRIA])
+    # Esperamos a tener particiones asignadas ANTES de enviar nada; si no, la respuesta
+    # de CENTRAL podría llegar antes de que estemos escuchando y la perderíamos.
+    limite = time.time() + 15
+    while not consumer.assignment() and time.time() < limite:
+        consumer.poll(timeout_ms=200)
+    for tp in consumer.assignment():
+        consumer.position(tp)       # fija el offset "latest" ya
+    return consumer
+
+
+def hilo_consumidor(consumer):
+    """Filtra lo que llega: respuestas dirigidas a este operario y telemetría del
+    riego que tiene en curso. Lo deja en la bandeja para el hilo principal."""
+    while True:
+        lotes = consumer.poll(timeout_ms=500)
+        for registros in lotes.values():
+            for r in registros:
+                m = r.value
+                if r.topic == TOPIC_RESPUESTAS and m.get("op_id") == op_id:
+                    bandeja.put(m)
+                elif (r.topic == TOPIC_TELEMETRIA and m.get("tipo") == "TELEMETRIA"
+                      and m.get("req_id") == riego_activo["req_id"]):
+                    bandeja.put(m)
+
+
+def enviar(mensaje):
+    mensaje["ts"] = time.time()
+    producer.send(TOPIC_SOLICITUDES, key=op_id, value=mensaje)
+    producer.flush(timeout=5)
+
+
+def vaciar_bandeja():
+    while not bandeja.empty():
+        bandeja.get_nowait()
+
+
+# ===========================================================================
+# SERVICIOS
+# ===========================================================================
+def solicitar_riego(ws_id, duracion):
+    """Pide un riego y se queda acompañándolo hasta el final.
+    Devuelve True si el servicio terminó con resumen, False si fue denegado o falló."""
+    req_id = f"{op_id}-{uuid.uuid4().hex[:8]}"
+    vaciar_bandeja()
+    riego_activo.update(req_id=req_id, ws_id=ws_id)
+    print(f"\n[FO {op_id}] Solicitando riego en {ws_id} durante {duracion}s (petición {req_id})")
+    enviar({"tipo": "SOLICITUD", "req_id": req_id, "op_id": op_id,
+            "ws_id": ws_id, "duracion": duracion})
+
+    autorizado = False
+    try:
+        while True:
+            espera = TIMEOUT_TELEMETRIA if autorizado else TIMEOUT_RESPUESTA
+            try:
+                m = bandeja.get(timeout=espera)
+            except queue.Empty:
+                if autorizado:
+                    print(f"\n[FO {op_id}] ✖ Se ha perdido la comunicación con {ws_id} durante el riego.")
+                else:
+                    print(f"[FO {op_id}] ✖ CENTRAL no responde. Petición abandonada.")
+                return False
+            if m.get("req_id") != req_id:
+                continue                      # restos de peticiones anteriores
+            tipo = m.get("tipo")
+            if tipo == "INFO":
+                print(f"[FO {op_id}] · {m['mensaje']}")
+            elif tipo == "DENEGADO":
+                print(f"[FO {op_id}] ✖ DENEGADO: {m['mensaje']}")
+                return False
+            elif tipo == "AUTORIZADO":
+                autorizado = True
+                print(f"[FO {op_id}] ✔ {m['mensaje']}")
+            elif tipo == "TELEMETRIA":
+                print(f"[FO {op_id}]   {ws_id} regando | caudal {m['caudal']:5.2f} l/min | "
+                      f"acumulado {m['volumen']:7.2f} l | {m.get('transcurrido', 0):5.1f}s")
+            elif tipo == "RESUMEN":
+                print(f"\n[FO {op_id}] ===== RESUMEN DEL SERVICIO =====")
+                print(f"   Estación : {ws_id}")
+                print(f"   Motivo   : {m.get('motivo')}")
+                print(f"   Duración : {m.get('duracion')} s")
+                print(f"   Litros   : {m.get('litros')} l")
+                print("   ================================")
+                # Fuga o pérdida de la estación = servicio fallido
+                return m.get("motivo") not in ("FUGA", "SIN_NOTICIAS_ESTACION")
+    finally:
+        riego_activo.update(req_id=None, ws_id=None)
+
+
+def listar_estaciones():
+    req_id = f"{op_id}-{uuid.uuid4().hex[:8]}"
+    vaciar_bandeja()
+    enviar({"tipo": "LISTAR", "req_id": req_id, "op_id": op_id})
+    limite = time.time() + 5
+    while time.time() < limite:
+        try:
+            m = bandeja.get(timeout=limite - time.time())
+        except queue.Empty:
+            break
+        if m.get("tipo") == "LISTADO" and m.get("req_id") == req_id:
+            print("\n  ID      UBICACIÓN               ESTADO")
+            for e in m["estaciones"]:
+                marca = "  <- disponible" if e["estado"] == "DISPONIBLE" else ""
+                print(f"  {e['ws_id']:<7} {e['ubicacion']:<23} {e['estado']}{marca}")
+            return
+    print(f"[FO {op_id}] ✖ CENTRAL no ha respondido al listado.")
+
+
+def leer_fichero(ruta):
+    """Devuelve una lista de (ws_id, duracion) a partir del fichero de peticiones."""
+    peticiones = []
+    with open(ruta, encoding="utf-8") as f:
+        for n, linea in enumerate(f, 1):
+            linea = linea.strip()
+            if not linea or linea.startswith("#"):
+                continue
+            try:
+                ws_id, duracion = [p.strip() for p in linea.split(",")]
+                peticiones.append((ws_id, int(duracion)))
+            except ValueError:
+                print(f"[FO {op_id}] Línea {n} ignorada (formato esperado WS-01,15): {linea!r}")
+    return peticiones
+
+
+def modo_fichero(ruta):
+    peticiones = leer_fichero(ruta)
+    print(f"[FO {op_id}] {len(peticiones)} peticiones cargadas de {ruta}")
+    for i, (ws_id, duracion) in enumerate(peticiones, 1):
+        print(f"\n[FO {op_id}] ---- Servicio {i}/{len(peticiones)} ----")
+        ok = solicitar_riego(ws_id, duracion)
+        print(f"[FO {op_id}] Servicio {i} {'COMPLETADO' if ok else 'FALLIDO'}.")
+        if i < len(peticiones):
+            print(f"[FO {op_id}] Esperando {ESPERA_ENTRE_SERVICIOS}s antes del siguiente...")
+            time.sleep(ESPERA_ENTRE_SERVICIOS)
+    print(f"\n[FO {op_id}] Fichero terminado.")
+
+
+def modo_interactivo():
+    while True:
+        print("\n========== MENÚ OPERARIO", op_id, "==========")
+        print(" 1. Solicitar riego")
+        print(" 2. Ver estaciones")
+        print(" 3. Ejecutar peticiones desde fichero")
+        print(" 0. Salir")
+        try:
+            opcion = input("Opción: ").strip()
+        except EOFError:
+            return
+        if opcion == "1":
+            ws_id = input("  ID de la estación (ej. WS-01): ").strip().upper()
+            dur = input("  Duración en segundos [10]: ").strip()
+            solicitar_riego(ws_id, int(dur) if dur.isdigit() else 10)
+        elif opcion == "2":
+            listar_estaciones()
+        elif opcion == "3":
+            modo_fichero(input("  Ruta del fichero: ").strip())
+        elif opcion == "0":
+            return
+
+
+# ===========================================================================
+# PROGRAMA PRINCIPAL
+# ===========================================================================
 def iniciar_operario():
-    # 1. Preparar el programa para leer lo que escribimos en la terminal
+    global op_id, producer
     parser = argparse.ArgumentParser(description="Aplicación del Operario (WM_FO)")
-    
-    # 2. Definir qué datos obligatorios le vamos a pedir
-    parser.add_argument('--broker', required=True, help='IP y puerto de Kafka (ej: localhost:9092)')
-    parser.add_argument('--id', required=True, help='ID único del operario (ej: OP-01)')
-    
-    # 3. Leer los datos ingresados
+    parser.add_argument("--broker", required=True, help="IP y puerto de Kafka (ej: localhost:9092)")
+    parser.add_argument("--id", required=True, help="ID único del operario (ej: FO-01)")
+    parser.add_argument("--fichero", help="Fichero con peticiones (modo automático)")
     args = parser.parse_args()
-    
-    broker = args.broker
-    id_operario = args.id
-    
-    # 4. Imprimir por pantalla para comprobar que los ha leído bien
+    op_id = args.id
+
     print("=======================================")
-    print(f"🚜 INICIANDO TERMINAL DE OPERARIO")
-    print(f"👤 ID del Operario: {id_operario}")
-    print(f"📡 Conectando al broker: {broker}")
+    print("🚜 INICIANDO TERMINAL DE OPERARIO")
+    print(f"👤 ID del Operario: {op_id}")
+    print(f"📡 Conectando al broker: {args.broker}")
     print("=======================================\n")
-    
-    # Aquí es donde en la Semana 2 meteremos la lógica para enviar peticiones de riego
-    print("Esperando órdenes...")
+
+    try:
+        producer = KafkaProducer(
+            bootstrap_servers=[args.broker],
+            key_serializer=lambda k: k.encode("utf-8") if k else None,
+            value_serializer=lambda v: json.dumps(v).encode("utf-8"),
+        )
+        consumer = crear_consumidor(args.broker)
+    except NoBrokersAvailable:
+        print(f"✖ No hay broker Kafka disponible en {args.broker}")
+        sys.exit(1)
+    threading.Thread(target=hilo_consumidor, args=(consumer,), daemon=True).start()
+    print("Conectado a Kafka.")
+
+    try:
+        if args.fichero:
+            modo_fichero(args.fichero)
+        else:
+            modo_interactivo()
+    except KeyboardInterrupt:
+        pass
+    print(f"\n[FO {op_id}] Saliendo.")
+
 
 if __name__ == "__main__":
     iniciar_operario()
