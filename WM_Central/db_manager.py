@@ -85,7 +85,7 @@ def actualizar_estado_estacion(ws_id, nuevo_estado):
     conn.commit()
     conn.close()
 
-# --- Añadido semana 3 (Ariadna): consultas para la coordinación de riego por Kafka ---
+# consultas para la coordinación de riego por Kafka
 def get_estado_estacion(ws_id):
     """Devuelve el estado de la estación, o None si no existe."""
     conn = sqlite3.connect(DB_PATH)

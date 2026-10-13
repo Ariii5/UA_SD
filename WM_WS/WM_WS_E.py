@@ -22,7 +22,7 @@ from kafka.errors import NoBrokersAvailable
 
 simular_fuga = False
 
-# ---------------- KAFKA ----------------
+#Kafka
 TOPIC_TELEMETRIA = "wm_telemetria"   # Engine -> Central y operarios
 TOPIC_ORDENES = "wm_ordenes"         # Central -> Engine
 TOPIC_SOLICITUDES = "wm_solicitudes" # Engine -> Central (riego manual desde la estación)
@@ -42,7 +42,7 @@ def publicar(topic, mensaje):
         print(f"[ENGINE] Error publicando en Kafka: {e}")
 
 
-# ---------------- ELECTROVÁLVULA + CAUDALÍMETRO ----------------
+#electroválvula y caudalímetro
 CAUDAL_NOMINAL = 12.0   # litros/minuto con la válvula abierta
 
 lock = threading.Lock()  # protege 'riego', que lo tocan varios hilos
@@ -97,7 +97,7 @@ def cerrar_valvula(motivo):
         producer.flush(timeout=3)   # obliga a enviar ya lo pendiente: el FIN no se puede perder
     except Exception:
         # Kafka va lento: el FIN sigue en la cola del productor y se enviará en cuanto se pueda.
-        # NO dejamos que el error rompa el hilo (antes esto tumbaba el caudalímetro).
+        # NO dejamos que el error rompa el hilo
         print("[ENGINE] Aviso: Kafka tarda en confirmar el FIN; se reintentará automáticamente.")
 
 
@@ -127,7 +127,7 @@ def bucle_caudalimetro():
             return
 
 
-# ---------------- TECLADO ----------------
+#Teclado
 def keyboard_listener():
     """Escucha la pulsación de teclas en la terminal."""
     global simular_fuga
@@ -154,7 +154,7 @@ def keyboard_listener():
             cerrar_valvula("PARADA_MANUAL")
 
 
-# ---------------- ÓRDENES DE CENTRAL POR KAFKA ----------------
+#ordenes por kafka
 def escuchar_ordenes(broker):
     """Hilo consumidor: obedece las órdenes para esta estación y muestra las
     respuestas de CENTRAL a los riegos manuales pedidos desde aquí."""
@@ -199,7 +199,7 @@ def procesar_orden(orden):
         cerrar_valvula(orden.get("motivo", "ORDEN_CENTRAL"))
 
 
-# ---------------- CIERRE DE LA VENTANA ----------------
+#cierra la ventana
 def instalar_cierre_ventana():
     """Hace que, si se cierra la ventana (la X) o se mata el proceso, se cierre
     la electroválvula y se publique el FIN antes de morir."""
@@ -231,7 +231,6 @@ def instalar_cierre_ventana():
         signal.signal(signal.SIGTERM, manejador_senal)
 
 
-# ---------------- PROGRAMA PRINCIPAL ----------------
 if __name__ == "__main__":
     if len(sys.argv) < 4:
         print("Uso: py WM_WS_E.py <ip_broker:puerto> <ip_monitor> <puerto_monitor>")
@@ -248,7 +247,7 @@ if __name__ == "__main__":
 
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     try:
-        # 1. Conexión con el Monitor y recepción del ID
+        #Conexión con el Monitor y recepción del ID
         sock.connect((ip_monitor, puerto_monitor))
         print(f"[ENGINE] Conectado al Monitor en {ip_monitor}:{puerto_monitor}")
         primera = sock.recv(1024).decode("utf-8").strip()
@@ -258,7 +257,7 @@ if __name__ == "__main__":
         ws_id = primera.split("#", 1)[1]
         print(f"[ENGINE] Estación asignada: {ws_id}")
 
-        # 2. Conexión con Kafka
+        #Conexión con Kafka
         try:
             producer = KafkaProducer(
                 bootstrap_servers=[broker],
@@ -270,19 +269,19 @@ if __name__ == "__main__":
             sys.exit(1)
         print(f"[ENGINE] Conectado a Kafka en {broker}")
 
-        # 2b. Hilo que escucha las órdenes de Central
+        #Hilo que escucha las órdenes de Central
         threading.Thread(target=escuchar_ordenes, args=(broker,), daemon=True).start()
 
-        # 3. A partir de aquí, cerrar la ventana cierra la válvula de forma ordenada
+        #A partir de aquí, cerrar la ventana cierra la válvula de forma ordenada
         instalar_cierre_ventana()
 
         print("[ENGINE] Respondiendo 'OK' a los pulsos de salud.")
         print("[ENGINE] Teclas: k = avería | a <seg> = pedir riego manual a CENTRAL | p = parar riego\n")
 
-        # 4. Hilo para leer el teclado en paralelo
+        #Hilo para leer el teclado en paralelo
         threading.Thread(target=keyboard_listener, daemon=True).start()
 
-        # 5. Bucle principal: pulsos de salud del Monitor
+        #Bucle principal: pulsos de salud del Monitor
         sock.settimeout(1.0)   # recv espera como mucho 1 s: así Ctrl+C funciona en Windows
         while True:
             try:
@@ -307,9 +306,9 @@ if __name__ == "__main__":
         print(f"[ENGINE] Desconexión: {e}")
     finally:
         if producer:
-            cerrar_valvula("PROCESO_DETENIDO")   # nunca dejar el agua corriendo al salir
+            cerrar_valvula("PROCESO_DETENIDO")   #nunca dejar el agua corriendo al salir
             try:
-                producer.close(timeout=3)        # envía lo pendiente y suelta la conexión con Kafka
+                producer.close(timeout=3)        #envía lo pendiente y suelta la conexión con Kafka
             except Exception:
                 pass
         sock.close()

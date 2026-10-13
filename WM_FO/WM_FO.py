@@ -35,9 +35,8 @@ bandeja = queue.Queue()         # mensajes relevantes para este operario
 riego_activo = {"req_id": None, "ws_id": None}   # para filtrar la telemetría
 
 
-# ===========================================================================
-# KAFKA
-# ===========================================================================
+
+#KAFKA
 def crear_consumidor(broker):
     """Cada operario usa un group_id ÚNICO: así recibe todos los mensajes del topic
     (si dos FO compartieran grupo, Kafka repartiría los mensajes entre ellos)."""
@@ -85,9 +84,8 @@ def vaciar_bandeja():
         bandeja.get_nowait()
 
 
-# ===========================================================================
-# SERVICIOS
-# ===========================================================================
+
+#Servicios
 def solicitar_riego(ws_id, duracion):
     """Pide un riego y se queda acompañándolo hasta el final.
     Devuelve True si el servicio terminó con resumen, False si fue denegado o falló."""
@@ -207,10 +205,6 @@ def modo_interactivo():
         elif opcion == "0":
             return
 
-
-# ===========================================================================
-# PROGRAMA PRINCIPAL
-# ===========================================================================
 def iniciar_operario():
     global op_id, producer
     parser = argparse.ArgumentParser(description="Aplicación del Operario (WM_FO)")

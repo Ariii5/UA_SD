@@ -4,8 +4,8 @@
 # - autenticarlas usando la base de datos SQLite
 # - Reaccionar de inmediato si alguna se avería
 # - (Kafka) recibir las peticiones de riego de los operarios, validar que la estación
-#   esté disponible, ordenar la apertura al Engine, responder al operario y enviarle
-#   el resumen final del riego
+#esté disponible, ordenar la apertura al Engine, responder al operario y enviarle
+#el resumen final del riego
 import sys
 import json
 import time
@@ -25,7 +25,7 @@ def handle_monitor_client(client_socket, client_address):
     ws_id = None
     print(f"\n[CENTRAL] Conexión TCP entrante desde {client_address}") #client address--> tupla de la IP y puerto
     try:
-        # 1. Handshake inicial
+        #Handshake inicial
         data = client_socket.recv(1024)#hilo se pausa hasta que llegan bytes por la red
         if data != ENQ:
             print(f"[CENTRAL] Byte recibido incorrecto ({data}). Enviando <NACK>...")
@@ -37,7 +37,7 @@ def handle_monitor_client(client_socket, client_address):
 
         # convierte los bytes entrantes en texto legible mediante 'decode'
         reg_data = client_socket.recv(1024).decode('utf-8').strip()
-        #'cada vez que nos envíemos datos separaremos cada dato con una almohadilla
+        #cada vez que nos envíemos datos separaremos cada dato con una almohadilla
         partes = reg_data.split("#")
 
         if len(partes) == 3 and partes[0] == "REG":
@@ -56,7 +56,7 @@ def handle_monitor_client(client_socket, client_address):
             client_socket.sendall(NACK)
             return
 
-        # 3. Mantener la escucha de alertas mientras la estación siga viva
+        #Mantener la escucha de alertas mientras la estación siga viva
         while True:
             #el hilo se queda escuchando sin gastar ciclos
             msg = client_socket.recv(1024)
@@ -79,12 +79,12 @@ def handle_monitor_client(client_socket, client_address):
 
 
 #actúa como recepcionista de la central, su propósito es poner en marcha el servidor de red, quedarse esperando llamadas entrantes de los monitores
-#de ruefi (WM_WS_M) y derivar cada conexión a un hilo independiente
+#y derivar cada conexión a un hilo independiente
 def start_socket_server(port):
     #crea el objeto de socket de red
     server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     #activa la reutilización automática del puerto local.
-    #aunque hagas contro + C y lo vuelvas a usar inmediatamente
+    #aunque hagas control + C y se vuelva a ejectuar inmediatamente
     server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
 
     #enlaza el socket a una interfaz física y a un puerto. Al poner 0.0.0.0 le ordena que escuche en todas las tarjetas e interfaces de red del equipo
@@ -103,24 +103,24 @@ def start_socket_server(port):
         thread.start()
 
 
-# ==============================================================================
-# COORDINACIÓN DE RIEGO POR KAFKA (Ariadna - semana 3)
-# ==============================================================================
+
+# COORDINACIÓN DE RIEGO POR KAFKA
+
 # Topics (deben llamarse igual en WM_FO y WM_WS_E)
-TOPIC_SOLICITUDES = "wm_solicitudes"   # Operario/estación -> CENTRAL : SOLICITUD, LISTAR
-TOPIC_RESPUESTAS = "wm_respuestas"     # CENTRAL -> Operario         : INFO, AUTORIZADO, DENEGADO, RESUMEN, LISTADO
-TOPIC_ORDENES = "wm_ordenes"           # CENTRAL -> Engine           : ABRIR, CERRAR
-TOPIC_TELEMETRIA = "wm_telemetria"     # Engine -> CENTRAL/Operario  : INICIO, TELEMETRIA, FIN, RECHAZO
+TOPIC_SOLICITUDES = "wm_solicitudes"   # Operario/estación -> CENTRAL: SOLICITUD, LISTAR
+TOPIC_RESPUESTAS = "wm_respuestas"     # CENTRAL -> Operario: INFO, AUTORIZADO, DENEGADO, RESUMEN, LISTADO
+TOPIC_ORDENES = "wm_ordenes"           # CENTRAL -> Engine: ABRIR, CERRAR
+TOPIC_TELEMETRIA = "wm_telemetria"     # Engine -> CENTRAL/Operario: INICIO, TELEMETRIA, FIN, RECHAZO
 
 TIMEOUT_APERTURA = 5    # s que esperamos a que el Engine confirme la apertura (INICIO)
 TIMEOUT_SIN_NOTICIAS = 8  # s sin telemetría de un riego en curso -> se da por terminado
-MAX_ANTIGUEDAD = 30     # s: peticiones más viejas se descartan (p.ej. Central estaba caída)
+MAX_ANTIGUEDAD = 30   # s: peticiones más viejas se descartan (p.ej. Central estaba caída)
 
 producer = None
 lock_riegos = threading.Lock()
-# Riegos pedidos al Engine pero aún sin confirmar:  ws_id -> datos de la petición
+#Riegos pedidos al Engine pero aún sin confirmar:  ws_id -> datos de la petición
 pendientes = {}
-# Riegos en curso:  ws_id -> {req_id, op_id, caudal, volumen, transcurrido, sol}
+#Riegos en curso:  ws_id -> {req_id, op_id, caudal, volumen, transcurrido, sol}
 activos = {}
 
 
@@ -143,19 +143,19 @@ def denegar(sol, motivo):
     responder_operario("DENEGADO", sol, motivo)
 
 
-# ---------- 1. Peticiones que llegan de los operarios ----------
+#1. Peticiones que llegan de los operarios
 def procesar_solicitud(sol):
     op_id = sol.get("op_id")
     ws_id = sol.get("ws_id")
     print(f"[CENTRAL-RIEGO] Petición de {op_id}: regar {ws_id} durante {sol.get('duracion')}s")
     responder_operario("INFO", sol, f"CENTRAL ha recibido la petición. Comprobando {ws_id}...")
 
-    # a) El operario tiene que estar registrado (salvo si lo pide CENTRAL o la propia estación)
+    #El operario tiene que estar registrado
     interno = op_id == "CENTRAL" or str(op_id).startswith("MANUAL-")
     if not interno and not existe_operario(op_id):
         return denegar(sol, f"El operario {op_id} no está registrado en CENTRAL")
 
-    # b) La estación tiene que existir, estar DISPONIBLE y no tener otro riego en marcha
+    #La estación tiene que existir, estar DISPONIBLE y no tener otro riego en marcha
     estado = get_estado_estacion(ws_id)
     if estado is None:
         return denegar(sol, f"La estación {ws_id} no existe")
@@ -164,7 +164,7 @@ def procesar_solicitud(sol):
             return denegar(sol, f"La estación {ws_id} ya está ocupada con otro riego")
         if estado != "DISPONIBLE":
             return denegar(sol, f"La estación {ws_id} no está disponible (estado: {estado})")
-        # c) La reservamos y le ordenamos abrir
+        #La reservamos y le ordenamos abrir
         pendientes[ws_id] = {"enviado": time.time(), "sol": sol}
 
     responder_operario("INFO", sol, f"{ws_id} disponible. Solicitando apertura de la electroválvula...")
@@ -179,7 +179,7 @@ def procesar_listado(sol):
     responder_operario("LISTADO", sol, "Estado de las estaciones", estaciones=estaciones)
 
 
-# ---------- 2. Eventos que llegan de los Engines ----------
+#Eventos que llegan de los Engines
 def procesar_evento_ws(ev):
     tipo = ev.get("tipo")
     ws_id = ev.get("ws_id")
@@ -265,7 +265,7 @@ def vigilar_timeouts():
                                duracion=a["transcurrido"], litros=a["volumen"])
 
 
-# ---------- 3. Bucle consumidor ----------
+#Bucle consumidor
 def bucle_kafka(broker):
     # Un único consumidor para peticiones y telemetría: todas las decisiones se toman
     # en un solo hilo y en orden, así dos peticiones a la misma estación no se cruzan.
@@ -329,7 +329,7 @@ def iniciar_kafka(broker):
     threading.Thread(target=vigilar_timeouts, daemon=True).start()
 
 
-# ---------- 4. Funciones para el panel y la administración (las usará Sara) ----------
+#Funciones para el panel y la administración
 def forzar_riego(ws_id, duracion=30):
     """Opción 'Iniciar un riego' de CENTRAL: se comporta igual que si lo pidiera un operario."""
     enviar(TOPIC_SOLICITUDES, {"tipo": "SOLICITUD", "req_id": f"CEN-{uuid.uuid4().hex[:8]}",
