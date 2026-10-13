@@ -3,19 +3,16 @@ import socket
 import threading
 import time
 #su mision es revisar WM_WS_E y avisar a la central si detecta un fallo
-# ==============================================================================
-# BYTES DE CONTROL (El protocolo de saludo)
-# ==============================================================================
-ENQ = b'\x05'   # "¿Estás ahí?" (Enquiry). Lo enviamos nosotros a Central.
-ACK = b'\x06'   # "Sí, todo bien" (Acknowledge). Esperamos que Central nos conteste esto.
-NACK = b'\x15'  # "Algo fue mal" (Negative Acknowledge).
+#bytes de control
+ENQ = b'\x05'   #Lo enviamos nosotros a Central para ver si alguien escucha
+ACK = b'\x06'   #Esperamos que Central nos conteste
+NACK = b'\x15'  #Error
 
 # Variables globales para compartir los sockets entre hilos
 sock_central_global = None
 
-# ==============================================================================
-# ROL 1: SERVIDOR (El Monitor escucha y vigila a su propio motor local WM_WS_E)
-# ==============================================================================
+
+#El Monitor escucha y vigila a su propio motor local WM_WS_E
 def health_pulse_worker(engine_socket, ws_id):
     """
     Hilo dedicado a vigilar la salud del Engine cada segundo.
@@ -72,9 +69,7 @@ def start_engine_server(listen_port, ws_id):
         t = threading.Thread(target=handle_engine_connection, args=(engine_sock, addr, ws_id), daemon=True)
         t.start()
 
-# ==============================================================================
-# ROL 2: CLIENTE (El Monitor llama por teléfono a WM_Central)
-# ==============================================================================
+#CLIENTE (El Monitor llama por teléfono a WM_Central)
 #se encarga de llamar a la central, superar el protocolo de saludo, autenticar la estación con su identificador
 # y ubicaciónm, y dejar guardado el canal de comunicación para futuras emergencias
 def connect_to_central(central_ip, central_port, ws_id, ubicacion):
@@ -123,9 +118,6 @@ def connect_to_central(central_ip, central_port, ws_id, ubicacion):
         print(f"[{ws_id} - CLIENTE] Error en la comunicación con Central: {e}")
         return None
 
-# ==============================================================================
-# PUNTO DE ARRANQUE DEL PROGRAMA
-# ==============================================================================
 if __name__ == "__main__":
     if len(sys.argv) < 7:
         print("Uso: python3 WM_WS_M.py <ip_e> <puerto_e> <puerto_escucha_e> <ip_central> <puerto_central> <id_ws> [ubicacion]")
@@ -144,7 +136,7 @@ if __name__ == "__main__":
     print(f"   INICIANDO MONITOR ({ws_id}) [CLIENTE & SERVIDOR]")
     print("=" * 55)
 
-    # 1. Arrancar el servidor local para el Engine
+    #Arrancar el servidor local para el Engine
     engine_server_thread = threading.Thread(
         target=start_engine_server, 
         args=(puerto_escucha_engine, ws_id),
@@ -152,10 +144,10 @@ if __name__ == "__main__":
     )
     engine_server_thread.start()
 
-    # 2. Conectarse y registrarse en Central
+    #Conectarse y registrarse en Central
     sock_central = connect_to_central(ip_central, puerto_central, ws_id, ubicacion)
 
-    # 3. Mantener el proceso vivo
+    #Mantener el proceso vivo
     try:
         if sock_central:
             print(f"[{ws_id}] Canal con Central abierto y listo. Pulsa Ctrl+C para finalizar.\n")
