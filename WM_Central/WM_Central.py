@@ -8,6 +8,7 @@
 #el resumen final del riego
 import sys
 import json
+import io
 import time
 import uuid
 import socket
