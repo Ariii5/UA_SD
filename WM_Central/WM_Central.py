@@ -615,12 +615,12 @@ if __name__ == "__main__":
     # 1. Servidor de sockets (hilo daemon)
     threading.Thread(target=start_socket_server, args=(socket_port,), daemon=True).start()
 
-    # Si detecta terminal interactiva (local en tu Mac), lanza prompt_toolkit.
-# En la nube (Docker en Railway sin teclado), mantiene el servidor escuchando sockets y Kafka.
+    # En Mac con terminal abre el panel; en Railway (Docker) mantiene el servidor sin TTY
     if sys.stdin and sys.stdin.isatty():
         ejecutar_consola_admin()
     else:
-        print("[CENTRAL] Ejecutando en modo servidor cloud (sin consola interactiva TTY).")
+        print("[CENTRAL] Servidor Cloud iniciado en Railway.")
+        print("[CENTRAL] A la escucha de sockets TCP y Kafka...")
         try:
             while True:
                 time.sleep(3600)
