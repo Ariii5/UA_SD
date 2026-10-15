@@ -616,10 +616,14 @@ if __name__ == "__main__":
     threading.Thread(target=start_socket_server, args=(socket_port,), daemon=True).start()
 
     # En Mac con terminal abre el panel; en Railway (Docker) mantiene el servidor sin TTY
-    if sys.stdin and sys.stdin.isatty():
-        ejecutar_consola_admin()
-    else:
-        print("[CENTRAL] Servidor Cloud iniciado en Railway.")
+    # Modo servidor cloud automático si no hay TTY o si prompt_toolkit falla al registrar el teclado
+    try:
+        if sys.stdin and sys.stdin.isatty():
+            ejecutar_consola_admin()
+        else:
+            raise io.UnsupportedOperation("Entorno headless sin consola interactiva")
+    except Exception as e:
+        print(f"[CENTRAL] Consola interactiva omitida ({e}). Modo servidor continuo activo.")
         print("[CENTRAL] A la escucha de sockets TCP y Kafka...")
         try:
             while True:
