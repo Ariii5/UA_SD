@@ -41,9 +41,16 @@ En cumplimiento de la normativa de la asignatura, el registro de las consultas y
 - Python 3.10 o superior
 - Docker Desktop (en ejecución para Apache Kafka y contenedorización de Central)
 
+Para ejecutar Central directamente con Python, instala también Prompt Toolkit:
+
+```bash
+python3 -m pip install prompt_toolkit
+```
+
 ---
 
 Decisiones de diseño:
+
 - La clave de cada mensaje es el ID de la estación, para que todos sus eventos lleguen en orden (misma partición).
 - Cada Engine y cada operario usan un `group_id` propio para recibir **todos** los mensajes del topic y filtrar los suyos.
 - Central procesa peticiones y telemetría en un único hilo consumidor, de modo que dos peticiones simultáneas a la misma estación no pueden ser autorizadas a la vez.
@@ -56,6 +63,7 @@ Inicializa la base de datos relacional SQLite y arranca la escucha del servidor 
 ```bash
 python3 WM_Central/WM_Central.py 8000 localhost:9092
 ```
+
 ### Ejecución local (Windows)
 
 Con Kafka arrancado (`cd Kafka` y `docker compose up -d`), en terminales separadas desde la raíz del proyecto:

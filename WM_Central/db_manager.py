@@ -2,7 +2,8 @@
 import sqlite3
 import os
 
-DB_PATH = os.path.join(os.path.dirname(__file__), "water_management.db")
+DATA_DIR = "/app/data" if os.path.exists("/app/data") else os.path.dirname(__file__)
+DB_PATH = os.path.join(DATA_DIR, "water_management.db")
 
 def init_db():
     #Crea las tablas y carga datos de prueba si no existen.

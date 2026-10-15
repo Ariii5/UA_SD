@@ -5,8 +5,8 @@ ENV PYTHONUNBUFFERED=1
 
 WORKDIR /app
 
-# Librería de Kafka (coordinación de riego)
-RUN pip install --no-cache-dir kafka-python==2.2.15
+# Librerías necesarias: Kafka y Prompt Toolkit (panel interactivo sin parpadeo)
+RUN pip install --no-cache-dir kafka-python==2.2.15 prompt_toolkit
 
 # Copiar scripts del módulo central
 COPY db_manager.py .
