@@ -12,9 +12,6 @@ RUN pip install --no-cache-dir kafka-python==2.2.15 prompt_toolkit
 COPY db_manager.py .
 COPY WM_Central.py .
 
-# Directorio destinado a alojar la base de datos de forma persistente
-VOLUME ["/app/data"]
-
 # Puerto TCP de escucha para los monitores de estación
 EXPOSE 8000
 
