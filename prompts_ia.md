@@ -127,3 +127,63 @@
 
 > "¿Cómo estructuro el bucle de escucha del servidor en Central para que se quede esperando alertas como 'ALERT#FUGA' sin cerrarse, actualice la base de datos a AVERIADA y, si la estación se desconecta bruscamente o con Ctrl+C, use un bloque finally para marcarla automáticamente como DESCONECTADA?"  
 > **Propósito:** Asegurar la consistencia del ciclo de vida de las estaciones en SQLite dentro de `handle_monitor_client` en `WM_Central.py`.
+
+## Semana 3: Panel de Monitorización, Comandos de Administración y Despliegue en Railway
+
+### Diseño de la interfaz de consola sin parpadeo y separación de entrada
+
+**Fecha:** 13 de octubre de 2026  
+**Prompt:**
+
+> "En una aplicación servidora en Python donde necesito refrescar periódicamente una tabla con métricas en tiempo real (caudal y volumen) y a la vez permitir la entrada interactiva de comandos del usuario sin que la limpieza de pantalla (`clear`) borre lo que se está tecleando"  
+> **Propósito:** Evaluar y seleccionar el enfoque para el panel interactivo de `WM_Central`, adoptando una división en dos ventanas independientes (`HSplit` con `Window` y `TextArea`) para evitar el parpadeo de pantalla.
+
+---
+
+### Coordinación de órdenes administrativas frente a peticiones concurrentes
+
+**Fecha:** 13 de octubre de 2026  
+**Prompt:**
+
+> "Para cumplir con la opción de administración de forzar un riego desde la Central, ¿es preferible simular un mensaje de solicitud por el topic de peticiones o emitir directamente la orden de apertura a la cola de órdenes? ¿Cómo se gestionan las estructuras de reservas (`pendientes`) para que un comando manual no colisione con las peticiones habituales de los operarios?"  
+> **Propósito:** Diseñar las funciones `admin_forzar_riego`, `admin_bloquear_estacion` y `admin_activar_estacion` en `WM_Central.py`, sincronizando la estructura en memoria y la base de datos SQLite con los topics de Kafka.
+
+---
+
+### Incompatibilidad de directivas VOLUME en plataformas PaaS (Railway)
+
+**Fecha:** 15 de octubre de 2026  
+**Prompt:**
+
+> "Al compilar un contenedor en Railway mediante Dockerfile, el proceso falla en la fase de validación con el mensaje 'The Dockerfile failed validation. Please check the build logs... Remove the VOLUME instruction'. ¿Por qué la plataforma rechaza la instrucción VOLUME dentro del Dockerfile y cuál es la forma correcta de adjuntar almacenamiento persistente para SQLite?"  
+> **Propósito:** Eliminar la directiva estática `VOLUME` de `WM_Central/Dockerfile` y configurar el punto de montaje persistente directamente sobre la infraestructura del servicio en Railway (`/app/data`).
+
+---
+
+### Adaptación de bucles interactivos TTY para entornos headless en contenedores cloud
+
+**Fecha:** 15 de octubre de 2026  
+**Prompt:**
+
+> "Un servicio Python que funciona en local falla en Railway al arrancar con 'Warning: Input is not a terminal (fd=0)', lanzando `selectors.register PermissionError: [Errno 1] Operation not permitted` y `EOFError` dentro de `prompt_toolkit`. ¿Por qué ocurre esto al ejecutarse como contenedor sin consola TTY?"  
+> **Propósito:** Desarrollar un arranque tolerante en `WM_Central.py` que detecte la ausencia de terminal interactiva (`sys.stdin.isatty()`) y capture excepciones de registro para pasar de forma transparente a un modo de ejecución continua de sockets y Kafka sin detener el contenedor.
+
+---
+
+### Redirección TCP y configuración de proxies para brokers remotos y clientes locales
+
+**Fecha:** 15 de octubre de 2026  
+**Prompt:**
+
+> "Si tengo un servidor de sockets TCP escuchando en el puerto 8000 y un broker Kafka en el puerto interno 9092 dentro de Railway, ¿cómo deben configurarse los TCP Proxies públicos para que clientes locales externos puedan conectarse sin interferir con la comunicación privada entre contenedores de la misma red virtual?"  
+> **Propósito:** Establecer los dominios y puertos públicos proxy (`tramway.proxy.rlwy.net:32110` para sockets y `iriguchi.proxy.rlwy.net:57795` para Kafka) asegurando la interoperabilidad con las terminales locales `WM_WS_M`, `WM_WS_E` y `WM_FO`.
+
+---
+
+### Estructura técnica de una guía de despliegue reproducible para memorias de ingeniería
+
+**Fecha:** 15 de octubre de 2026  
+**Prompt:**
+
+> "¿Qué apartados esenciales debe contener una guía técnica de despliegue para una memoria de Sistemas Distribuidos con arquitectura híbrida (nube y local)? ¿Cómo se documenta de forma rigurosa la secuencia de construcción, las variables de entorno, la topología de red y las incidencias de ejecución resueltas durante el despliegue?"  
+> **Propósito:** Elaborar el borrador formal del apartado de despliegue para la memoria del proyecto, detallando la configuración del contenedor, volúmenes de datos y el protocolo de verificación extremo a extremo.
