@@ -21,17 +21,17 @@ import threading
 from kafka import KafkaProducer, KafkaConsumer
 from kafka.errors import NoBrokersAvailable
 
-TOPIC_SOLICITUDES = "wm_solicitudes"   # FO -> CENTRAL
-TOPIC_RESPUESTAS = "wm_respuestas"     # CENTRAL -> FO
-TOPIC_TELEMETRIA = "wm_telemetria"     # WS_E -> CENTRAL/FO
+TOPIC_SOLICITUDES = "wm_solicitudes"   # FO -> CENTRAL (escribe)
+TOPIC_RESPUESTAS = "wm_respuestas"     # CENTRAL -> FO (lee)
+TOPIC_TELEMETRIA = "wm_telemetria"     # WS_E -> CENTRAL/FO (lee)
 
 ESPERA_ENTRE_SERVICIOS = 4      # s (lo exige el enunciado en el modo fichero)
-TIMEOUT_RESPUESTA = 15          # s sin noticias de CENTRAL antes de autorizar -> fracaso
-TIMEOUT_TELEMETRIA = 10         # s sin telemetría durante un riego -> fracaso
+TIMEOUT_RESPUESTA = 15          # s sin noticias de CENTRAL antes de autorizar -> fracaso (resiliencia)
+TIMEOUT_TELEMETRIA = 10         # s sin telemetría durante un riego -> fracaso (resiliencia)
 
-op_id = None
-producer = None
-bandeja = queue.Queue()         # mensajes relevantes para este operario
+op_id = None #quien soy? se pone al arrancar
+producer = None #el productor Kafka que se crea al arrancar
+bandeja = queue.Queue()         # mensajes relevantes para este operario, queue puede tener los 2 hilos (consumidor y principal) accediendo a la vez
 riego_activo = {"req_id": None, "ws_id": None}   # para filtrar la telemetría
 
 
@@ -42,15 +42,16 @@ def crear_consumidor(broker):
     (si dos FO compartieran grupo, Kafka repartiría los mensajes entre ellos)."""
     consumer = KafkaConsumer(
         bootstrap_servers=[broker],
-        group_id=f"wm_fo_{op_id}_{uuid.uuid4().hex[:6]}",
-        auto_offset_reset="latest",
-        metadata_max_age_ms=3000,       # detectar pronto los topics si se crean después
-        value_deserializer=lambda b: json.loads(b.decode("utf-8")),
+        group_id=f"wm_fo_{op_id}", #grupo único por operario 
+        auto_offset_reset="latest", #empieza a leer desde ahora
+        enable_auto_commit=True,      #Kafka se encarga de recordar el offset
+        metadata_max_age_ms=3000,       #pregunta a kafka cada 3 segundos
+        value_deserializer=lambda b: json.loads(b.decode("utf-8")), #de bytes a texto
     )
-    consumer.subscribe([TOPIC_RESPUESTAS, TOPIC_TELEMETRIA])
+    consumer.subscribe([TOPIC_RESPUESTAS, TOPIC_TELEMETRIA]) #me apunto a los topics
     # Esperamos a tener particiones asignadas ANTES de enviar nada; si no, la respuesta
     # de CENTRAL podría llegar antes de que estemos escuchando y la perderíamos.
-    limite = time.time() + 15
+    limite = time.time() + 30
     while not consumer.assignment() and time.time() < limite:
         consumer.poll(timeout_ms=200)
     for tp in consumer.assignment():
@@ -67,10 +68,31 @@ def hilo_consumidor(consumer):
             for r in registros:
                 m = r.value
                 if r.topic == TOPIC_RESPUESTAS and m.get("op_id") == op_id:
-                    bandeja.put(m)
+                    if m.get("req_id") == riego_activo["req_id"]:
+                        bandeja.put(m)
+                    else:
+                        mostrar_pendiente(m)
                 elif (r.topic == TOPIC_TELEMETRIA and m.get("tipo") == "TELEMETRIA"
                       and m.get("req_id") == riego_activo["req_id"]):
                     bandeja.put(m)
+        if lotes:
+            try:
+                consumer.commit()
+            except Exception:
+                pass
+
+def mostrar_pendiente(m):
+    """Muestra un mensaje que no pertenece a la petición en curso"""
+    if m.get("tipo") == "RESUMEN":
+        print(f"\n[FO {op_id}] Resultado pendiente de un riego anterior ({m.get('req_id')}):")
+        print(f"   Estación : {m.get('ws_id')}")
+        print(f"   Motivo   : {m.get('motivo')}")
+        print(f"   Duración : {m.get('duracion')} s")
+        print(f"   Litros   : {m.get('litros')} l")
+        print("   ================================")
+    elif m.get("tipo") in ("AUTORIZADO", "DENEGADO"):
+        print(f"\n[FO {op_id}] Mensaje pendiente de un riego anterior ({m.get('req_id')}):")
+        print(f"   {m.get('tipo')} - {m.get('mensaje')}")
 
 
 def enviar(mensaje):
@@ -138,20 +160,26 @@ def solicitar_riego(ws_id, duracion):
 def listar_estaciones():
     req_id = f"{op_id}-{uuid.uuid4().hex[:8]}"
     vaciar_bandeja()
-    enviar({"tipo": "LISTAR", "req_id": req_id, "op_id": op_id})
-    limite = time.time() + 5
-    while time.time() < limite:
-        try:
-            m = bandeja.get(timeout=limite - time.time())
-        except queue.Empty:
-            break
-        if m.get("tipo") == "LISTADO" and m.get("req_id") == req_id:
-            print("\n  ID      UBICACIÓN               ESTADO")
-            for e in m["estaciones"]:
-                marca = "  <- disponible" if e["estado"] == "DISPONIBLE" else ""
-                print(f"  {e['ws_id']:<7} {e['ubicacion']:<23} {e['estado']}{marca}")
-            return
-    print(f"[FO {op_id}] ✖ CENTRAL no ha respondido al listado.")
+    riego_activo.update(req_id=req_id, ws_id=None)
+
+
+    try:
+        enviar({"tipo": "LISTAR", "req_id": req_id, "op_id": op_id})
+        limite = time.time() + 5
+        while time.time() < limite:
+            try:
+                m = bandeja.get(timeout=limite - time.time())
+            except queue.Empty:
+                break
+            if m.get("tipo") == "LISTADO" and m.get("req_id") == req_id:
+                print("\n  ID      UBICACIÓN               ESTADO")
+                for e in m["estaciones"]:
+                    marca = "  <- disponible" if e["estado"] == "DISPONIBLE" else ""
+                    print(f"  {e['ws_id']:<7} {e['ubicacion']:<23} {e['estado']}{marca}")
+                return
+        print(f"[FO {op_id}] X CENTRAL no ha respondido al listado.")
+    finally:
+        riego_activo.update(req_id=None, ws_id=None)
 
 
 def leer_fichero(ruta):
@@ -206,7 +234,7 @@ def modo_interactivo():
             return
 
 def iniciar_operario():
-    global op_id, producer
+    global op_id, producer #para modificar las variables globales, sino crearia nuevas que solo irian a la funcion
     parser = argparse.ArgumentParser(description="Aplicación del Operario (WM_FO)")
     parser.add_argument("--broker", required=True, help="IP y puerto de Kafka (ej: localhost:9092)")
     parser.add_argument("--id", required=True, help="ID único del operario (ej: FO-01)")
@@ -222,7 +250,7 @@ def iniciar_operario():
 
     try:
         producer = KafkaProducer(
-            bootstrap_servers=[args.broker],
+            bootstrap_servers=[args.broker], #dirección de kafka
             key_serializer=lambda k: k.encode("utf-8") if k else None,
             value_serializer=lambda v: json.dumps(v).encode("utf-8"),
         )
@@ -238,7 +266,7 @@ def iniciar_operario():
             modo_fichero(args.fichero)
         else:
             modo_interactivo()
-    except KeyboardInterrupt:
+    except KeyboardInterrupt: #esto es el cntl+c
         pass
     print(f"\n[FO {op_id}] Saliendo.")
 
