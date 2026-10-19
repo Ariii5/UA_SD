@@ -21,6 +21,7 @@ from kafka import KafkaProducer, KafkaConsumer
 from kafka.errors import NoBrokersAvailable
 
 simular_fuga = False
+monitor_conectado = False
 
 #Kafka
 TOPIC_TELEMETRIA = "wm_telemetria"   # Engine -> Central y operarios
@@ -60,6 +61,8 @@ riego = {
 def abrir_valvula(duracion, op_id=None, req_id=None):
     """Abre la válvula si se puede. Devuelve (True, "") o (False, motivo del rechazo)."""
     with lock:
+        if not monitor_conectado:
+            return False, "La estación está averiada (sin monitor)"
         if simular_fuga:
             return False, "La estación tiene una fuga/avería"
         if riego["valvula_abierta"]:
@@ -143,6 +146,9 @@ def keyboard_listener():
         elif cmd.startswith('a'):
             # Riego manual desde la estación: NO abrimos directamente, se lo pedimos
             # a CENTRAL como si fuéramos un operario, para que valide y lo registre.
+            if not monitor_conectado:
+                print("[ENGINE] ESTACIÓN AVERIADA: sin monitor. No se admiten riegos.")
+                continue
             partes = cmd.split()
             duracion = int(partes[1]) if len(partes) > 1 and partes[1].isdigit() else 10
             publicar(TOPIC_SOLICITUDES, {"tipo": "SOLICITUD",
@@ -231,6 +237,21 @@ def instalar_cierre_ventana():
         signal.signal(signal.SIGTERM, manejador_senal)
 
 
+def reconectar_monitor(ip, puerto):
+    while True:
+        time.sleep(3)
+        try:
+            s = socket.create_connection((ip, puerto), timeout=3)
+            s.settimeout(5)
+            if s.recv(1024).decode("utf-8").startswith("ID#"):
+                s.settimeout(1.0)
+                return s
+            s.close()
+        except OSError:
+            pass
+        print(f"[ENGINE] Monitor no disponible en {ip}:{puerto}. Reintentando en 3 s...")
+
+
 if __name__ == "__main__":
     if len(sys.argv) < 4:
         print("Uso: py WM_WS_E.py <ip_broker:puerto> <ip_monitor> <puerto_monitor>")
@@ -256,6 +277,7 @@ if __name__ == "__main__":
             sys.exit(1)
         ws_id = primera.split("#", 1)[1]
         print(f"[ENGINE] Estación asignada: {ws_id}")
+        monitor_conectado = True
 
         #Conexión con Kafka
         try:
@@ -288,9 +310,17 @@ if __name__ == "__main__":
                 data = sock.recv(1024)
             except socket.timeout:
                 continue
+            except OSError:
+                data = b""
             if not data:
-                print("[ENGINE] El Monitor ha cerrado la conexión.")
-                break
+                monitor_conectado = False
+                print("\n[ENGINE] ESTACIÓN AVERIADA: se ha perdido el Monitor.")
+                cerrar_valvula("MONITOR_CAIDO")
+                sock.close()
+                sock = reconectar_monitor(ip_monitor, puerto_monitor)
+                monitor_conectado = True
+                print("[ENGINE] Monitor recuperado. Estación operativa.")
+                continue
 
             if data == b"HEALTH?":
                 if simular_fuga:

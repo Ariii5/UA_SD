@@ -286,9 +286,13 @@ def procesar_evento_ws(ev):
         elif motivo == "BLOQUEO_ADMIN_CENTRAL" or estado_actual in ("FUERA DE SERVICIO", "BLOQUEADA"):
             actualizar_estado_estacion(ws_id, "FUERA DE SERVICIO")
 
+        elif motivo=="MONITOR_CAIDO":
+                    actualizar_estado_estacion(ws_id, "DESCONECTADA") 
+
         # 3. Solo si fue un fin normal (por tiempo límite o parada voluntaria) vuelve a DISPONIBLE
         elif estado_actual == "REGANDO":
             actualizar_estado_estacion(ws_id, "DISPONIBLE")
+          
 
         print(f"[CENTRAL-RIEGO] {ws_id} FIN de riego ({motivo}): "
               f"{ev.get('duracion')}s, {ev.get('litros')} l")

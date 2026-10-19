@@ -44,7 +44,7 @@ def crear_consumidor(broker):
         bootstrap_servers=[broker],
         group_id=f"wm_fo_{op_id}", #grupo único por operario 
         auto_offset_reset="latest", #empieza a leer desde ahora
-        enable_auto_commit=True,      #Kafka se encarga de recordar el offset
+        enable_auto_commit=False,      #Kafka se encarga de recordar el offset
         metadata_max_age_ms=3000,       #pregunta a kafka cada 3 segundos
         value_deserializer=lambda b: json.loads(b.decode("utf-8")), #de bytes a texto
     )
@@ -53,33 +53,37 @@ def crear_consumidor(broker):
     # de CENTRAL podría llegar antes de que estemos escuchando y la perderíamos.
     limite = time.time() + 30
     while not consumer.assignment() and time.time() < limite:
-        consumer.poll(timeout_ms=200)
+        lotes = consumer.poll(timeout_ms=200)
+        procesar_lotes(consumer, lotes)
     for tp in consumer.assignment():
         consumer.position(tp)       # fija el offset "latest" ya
     return consumer
 
 
 def hilo_consumidor(consumer):
-    """Filtra lo que llega: respuestas dirigidas a este operario y telemetría del
-    riego que tiene en curso. Lo deja en la bandeja para el hilo principal."""
     while True:
         lotes = consumer.poll(timeout_ms=500)
-        for registros in lotes.values():
-            for r in registros:
-                m = r.value
-                if r.topic == TOPIC_RESPUESTAS and m.get("op_id") == op_id:
-                    if m.get("req_id") == riego_activo["req_id"]:
-                        bandeja.put(m)
-                    else:
-                        mostrar_pendiente(m)
-                elif (r.topic == TOPIC_TELEMETRIA and m.get("tipo") == "TELEMETRIA"
-                      and m.get("req_id") == riego_activo["req_id"]):
+        procesar_lotes(consumer, lotes)
+
+
+def procesar_lotes(consumer, lotes):
+    for registros in lotes.values():
+        for r in registros:
+            m = r.value
+            if r.topic == TOPIC_RESPUESTAS and m.get("op_id") == op_id:
+                if m.get("req_id") == riego_activo["req_id"]:
                     bandeja.put(m)
-        if lotes:
-            try:
-                consumer.commit()
-            except Exception:
-                pass
+                else:
+                    mostrar_pendiente(m)
+            elif (r.topic == TOPIC_TELEMETRIA and m.get("tipo") == "TELEMETRIA"
+                  and m.get("req_id") == riego_activo["req_id"]):
+                bandeja.put(m)
+    if lotes:
+        try:
+            consumer.commit()
+        except Exception as e:
+            print(f"[FO {op_id}] No se pudo guardar la posición en Kafka: {e}")
+                
 
 def mostrar_pendiente(m):
     """Muestra un mensaje que no pertenece a la petición en curso"""
@@ -152,7 +156,7 @@ def solicitar_riego(ws_id, duracion):
                 print(f"   Litros   : {m.get('litros')} l")
                 print("   ================================")
                 # Fuga o pérdida de la estación = servicio fallido
-                return m.get("motivo") not in ("FUGA", "SIN_NOTICIAS_ESTACION")
+                return m.get("motivo") not in ("FUGA", "SIN_NOTICIAS_ESTACION", "MONITOR_CAIDO")
     finally:
         riego_activo.update(req_id=None, ws_id=None)
 
@@ -259,7 +263,7 @@ def iniciar_operario():
         print(f"✖ No hay broker Kafka disponible en {args.broker}")
         sys.exit(1)
     threading.Thread(target=hilo_consumidor, args=(consumer,), daemon=True).start()
-    print("Conectado a Kafka.")
+    time.sleep(2)
 
     try:
         if args.fichero:
