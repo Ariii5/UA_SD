@@ -385,6 +385,8 @@ def iniciar_kafka(broker):
             bootstrap_servers=[broker],
             key_serializer=lambda k: k.encode("utf-8") if k else None,
             value_serializer=lambda v: json.dumps(v).encode("utf-8"),
+            acks="all",
+           retries=5,
         )
     except NoBrokersAvailable:
         print(f"[CENTRAL-RIEGO] AVISO: no hay Kafka en {broker}. Central funcionará solo con sockets.")

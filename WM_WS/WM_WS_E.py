@@ -17,6 +17,7 @@ import time
 import random
 import json
 import signal
+import os
 from kafka import KafkaProducer, KafkaConsumer
 from kafka.errors import NoBrokersAvailable
 
@@ -28,9 +29,10 @@ TOPIC_TELEMETRIA = "wm_telemetria"   # Engine -> Central y operarios
 TOPIC_ORDENES = "wm_ordenes"         # Central -> Engine
 TOPIC_SOLICITUDES = "wm_solicitudes" # Engine -> Central (riego manual desde la estación)
 TOPIC_RESPUESTAS = "wm_respuestas"   # Central -> quien pidió el riego
-MAX_ANTIGUEDAD_ORDEN = 30            # s: órdenes más viejas se ignoran
+MAX_ANTIGUEDAD_ORDEN = 4            # s: órdenes más viejas se ignoran
 producer = None   # se crea en el main, cuando ya sabemos el ws_id
 ws_id = None      # nos lo envía el Monitor al conectarnos
+DIR_DATOS = os.path.join(os.path.dirname(os.path.abspath(__file__)), "datos")
 
 
 def publicar(topic, mensaje):
@@ -41,6 +43,42 @@ def publicar(topic, mensaje):
         producer.send(topic, key=ws_id, value=mensaje)
     except Exception as e:
         print(f"[ENGINE] Error publicando en Kafka: {e}")
+
+
+def fichero_estado():
+    return os.path.join(DIR_DATOS, f"riego_{ws_id}.json")
+
+
+def guardar_estado(datos):
+    os.makedirs(DIR_DATOS, exist_ok=True)
+    tmp = fichero_estado() + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(datos, f)
+    os.replace(tmp, fichero_estado())
+
+
+def borrar_estado():
+    try:
+        os.remove(fichero_estado())
+    except FileNotFoundError:
+        pass
+
+
+def recuperar_riego():
+    try:
+        with open(fichero_estado()) as f:
+            datos = json.load(f)
+    except (FileNotFoundError, ValueError):
+        return
+    print(f"[ENGINE] Riego interrumpido encontrado ({datos['litros']} l). Enviando estado final a CENTRAL...")
+    publicar(TOPIC_TELEMETRIA, {"tipo": "FIN", "motivo": "RECUPERADO_TRAS_CAIDA",
+                                "duracion": datos["duracion"], "litros": datos["litros"],
+                                "op_id": datos["op_id"], "req_id": datos["req_id"]})
+    try:
+        producer.flush(timeout=5)
+        borrar_estado()
+    except Exception:
+        print("[ENGINE] No se pudo enviar el estado final; se reintentará en el próximo arranque.")
 
 
 #electroválvula y caudalímetro
@@ -96,6 +134,7 @@ def cerrar_valvula(motivo):
     publicar(TOPIC_TELEMETRIA, {"tipo": "FIN", "motivo": motivo,
                                 "duracion": duracion, "litros": litros,
                                 "op_id": op_id, "req_id": req_id})
+    borrar_estado()
     try:
         producer.flush(timeout=3)   # obliga a enviar ya lo pendiente: el FIN no se puede perder
     except Exception:
@@ -119,6 +158,8 @@ def bucle_caudalimetro():
             limite = riego["duracion_max"]
             op_id = riego["op_id"]
             req_id = riego["req_id"]
+            guardar_estado({"op_id": op_id, "req_id": req_id, "litros": round(volumen, 2),
+                            "duracion": round(transcurrido, 1)})
         publicar(TOPIC_TELEMETRIA, {"tipo": "TELEMETRIA", "caudal": caudal,
                                     "volumen": round(volumen, 2),
                                     "transcurrido": round(transcurrido, 1),
@@ -158,6 +199,9 @@ def keyboard_listener():
             print(f"[ENGINE] Petición de riego manual ({duracion}s) enviada a CENTRAL...")
         elif cmd == 'p':
             cerrar_valvula("PARADA_MANUAL")
+        elif cmd == 'o':
+            simular_fuga = False
+            print("\n[ENGINE] Avería reparada. En el próximo pulso de salud se enviará 'OK'.\n")
 
 
 #ordenes por kafka
@@ -285,11 +329,14 @@ if __name__ == "__main__":
                 bootstrap_servers=[broker],
                 key_serializer=lambda k: k.encode("utf-8"),
                 value_serializer=lambda v: json.dumps(v).encode("utf-8"),
+                acks="all",
+                retries=5,
             )
         except NoBrokersAvailable:
             print(f"[ENGINE] Error: no hay ningún Kafka escuchando en {broker}")
             sys.exit(1)
         print(f"[ENGINE] Conectado a Kafka en {broker}")
+        recuperar_riego()
 
         #Hilo que escucha las órdenes de Central
         threading.Thread(target=escuchar_ordenes, args=(broker,), daemon=True).start()
@@ -298,7 +345,8 @@ if __name__ == "__main__":
         instalar_cierre_ventana()
 
         print("[ENGINE] Respondiendo 'OK' a los pulsos de salud.")
-        print("[ENGINE] Teclas: k = avería | a <seg> = pedir riego manual a CENTRAL | p = parar riego\n")
+        print(f"[ENGINE] PID: {os.getpid()}")
+        print("[ENGINE] Teclas: k = avería | o = reparar avería | a <seg> = pedir riego manual a CENTRAL | p = parar riego\n")
 
         #Hilo para leer el teclado en paralelo
         threading.Thread(target=keyboard_listener, daemon=True).start()

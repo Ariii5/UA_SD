@@ -7,3 +7,6 @@ __pycache__/
 
 # Basura de macOS
 .DS_Store
+
+#Estado de riego activo
+datos/

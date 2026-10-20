@@ -156,7 +156,7 @@ def solicitar_riego(ws_id, duracion):
                 print(f"   Litros   : {m.get('litros')} l")
                 print("   ================================")
                 # Fuga o pérdida de la estación = servicio fallido
-                return m.get("motivo") not in ("FUGA", "SIN_NOTICIAS_ESTACION", "MONITOR_CAIDO")
+                return m.get("motivo") not in ("FUGA", "SIN_NOTICIAS_ESTACION", "MONITOR_CAIDO", "RECUPERADO_TRAS_CAIDA")
     finally:
         riego_activo.update(req_id=None, ws_id=None)
 
@@ -257,6 +257,8 @@ def iniciar_operario():
             bootstrap_servers=[args.broker], #dirección de kafka
             key_serializer=lambda k: k.encode("utf-8") if k else None,
             value_serializer=lambda v: json.dumps(v).encode("utf-8"),
+            acks="all", #espera a que todos los brokers confirmen la recepción
+            retries=5,
         )
         consumer = crear_consumidor(args.broker)
     except NoBrokersAvailable:
