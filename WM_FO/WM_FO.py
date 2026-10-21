@@ -20,6 +20,8 @@ import threading
 
 from kafka import KafkaProducer, KafkaConsumer
 from kafka.errors import NoBrokersAvailable
+import logging
+logging.getLogger("kafka").addHandler(logging.NullHandler())
 
 TOPIC_SOLICITUDES = "wm_solicitudes"   # FO -> CENTRAL (escribe)
 TOPIC_RESPUESTAS = "wm_respuestas"     # CENTRAL -> FO (lee)
@@ -33,6 +35,7 @@ op_id = None #quien soy? se pone al arrancar
 producer = None #el productor Kafka que se crea al arrancar
 bandeja = queue.Queue()         # mensajes relevantes para este operario, queue puede tener los 2 hilos (consumidor y principal) accediendo a la vez
 riego_activo = {"req_id": None, "ws_id": None}   # para filtrar la telemetría
+ultimo_latido = time.time()
 
 
 
@@ -67,10 +70,13 @@ def hilo_consumidor(consumer):
 
 
 def procesar_lotes(consumer, lotes):
+    global ultimo_latido
     for registros in lotes.values():
         for r in registros:
             m = r.value
-            if r.topic == TOPIC_RESPUESTAS and m.get("op_id") == op_id:
+            if m.get("tipo") == "LATIDO":
+                ultimo_latido = time.time()
+            elif r.topic == TOPIC_RESPUESTAS and m.get("op_id") == op_id:
                 if m.get("req_id") == riego_activo["req_id"]:
                     bandeja.put(m)
                 else:
@@ -81,8 +87,8 @@ def procesar_lotes(consumer, lotes):
     if lotes:
         try:
             consumer.commit()
-        except Exception as e:
-            print(f"[FO {op_id}] No se pudo guardar la posición en Kafka: {e}")
+        except Exception:
+            print(f"[FO {op_id}] Reconectando con el gestor de colas...")
                 
 
 def mostrar_pendiente(m):
@@ -99,10 +105,28 @@ def mostrar_pendiente(m):
         print(f"   {m.get('tipo')} - {m.get('mensaje')}")
 
 
+def vigilar_central():
+    caida = False
+    while True:
+        time.sleep(1)
+        if time.time() - ultimo_latido > 6:
+            if not caida:
+                print(f"\n[FO {op_id}] ✖ Imposible conectar con WM_Central / gestor de colas. Esperando...")
+                caida = True
+        elif caida:
+            print(f"\n[FO {op_id}] ✔ WM_Central vuelve a estar disponible.")
+            caida = False
+
+
 def enviar(mensaje):
     mensaje["ts"] = time.time()
-    producer.send(TOPIC_SOLICITUDES, key=op_id, value=mensaje)
-    producer.flush(timeout=5)
+    try:
+        producer.send(TOPIC_SOLICITUDES, key=op_id, value=mensaje)
+        producer.flush(timeout=5)
+        return True
+    except Exception:
+        print(f"[FO {op_id}] ✖ Imposible conectar con WM_Central / gestor de colas.")
+        return False
 
 
 def vaciar_bandeja():
@@ -119,8 +143,10 @@ def solicitar_riego(ws_id, duracion):
     vaciar_bandeja()
     riego_activo.update(req_id=req_id, ws_id=ws_id)
     print(f"\n[FO {op_id}] Solicitando riego en {ws_id} durante {duracion}s (petición {req_id})")
-    enviar({"tipo": "SOLICITUD", "req_id": req_id, "op_id": op_id,
-            "ws_id": ws_id, "duracion": duracion})
+    if not enviar({"tipo": "SOLICITUD", "req_id": req_id, "op_id": op_id,
+                   "ws_id": ws_id, "duracion": duracion}):
+        riego_activo.update(req_id=None, ws_id=None)
+        return False
 
     autorizado = False
     try:
@@ -132,7 +158,7 @@ def solicitar_riego(ws_id, duracion):
                 if autorizado:
                     print(f"\n[FO {op_id}] ✖ Se ha perdido la comunicación con {ws_id} durante el riego.")
                 else:
-                    print(f"[FO {op_id}] ✖ CENTRAL no responde. Petición abandonada.")
+                    print(f"[FO {op_id}] ✖ Imposible conectar con WM_Central. Petición abandonada.")
                 return False
             if m.get("req_id") != req_id:
                 continue                      # restos de peticiones anteriores
@@ -168,7 +194,8 @@ def listar_estaciones():
 
 
     try:
-        enviar({"tipo": "LISTAR", "req_id": req_id, "op_id": op_id})
+        if not enviar({"tipo": "LISTAR", "req_id": req_id, "op_id": op_id}):
+            return
         limite = time.time() + 5
         while time.time() < limite:
             try:
@@ -181,7 +208,7 @@ def listar_estaciones():
                     marca = "  <- disponible" if e["estado"] == "DISPONIBLE" else ""
                     print(f"  {e['ws_id']:<7} {e['ubicacion']:<23} {e['estado']}{marca}")
                 return
-        print(f"[FO {op_id}] X CENTRAL no ha respondido al listado.")
+        print(f"[FO {op_id}] X Imposible conectar con WM_Central.")
     finally:
         riego_activo.update(req_id=None, ws_id=None)
 
@@ -238,7 +265,7 @@ def modo_interactivo():
             return
 
 def iniciar_operario():
-    global op_id, producer #para modificar las variables globales, sino crearia nuevas que solo irian a la funcion
+    global op_id, producer, ultimo_latido #para modificar las variables globales, sino crearia nuevas que solo irian a la funcion
     parser = argparse.ArgumentParser(description="Aplicación del Operario (WM_FO)")
     parser.add_argument("--broker", required=True, help="IP y puerto de Kafka (ej: localhost:9092)")
     parser.add_argument("--id", required=True, help="ID único del operario (ej: FO-01)")
@@ -259,12 +286,15 @@ def iniciar_operario():
             value_serializer=lambda v: json.dumps(v).encode("utf-8"),
             acks="all", #espera a que todos los brokers confirmen la recepción
             retries=5,
+            max_block_ms=5000,
         )
         consumer = crear_consumidor(args.broker)
     except NoBrokersAvailable:
         print(f"✖ No hay broker Kafka disponible en {args.broker}")
         sys.exit(1)
     threading.Thread(target=hilo_consumidor, args=(consumer,), daemon=True).start()
+    ultimo_latido = time.time()
+    threading.Thread(target=vigilar_central, daemon=True).start()
     time.sleep(2)
 
     try:

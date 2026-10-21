@@ -24,6 +24,8 @@ from prompt_toolkit.layout.dimension import Dimension
 from prompt_toolkit.patch_stdout import patch_stdout
 from prompt_toolkit.widgets import TextArea
 from db_manager import *
+import logging
+logging.getLogger("kafka").addHandler(logging.NullHandler())
 
 ENQ = b'\x05'   # Solicitud inicial
 ACK = b'\x06'   # Confirmación OK
@@ -377,6 +379,13 @@ def crear_topics(broker):
     except Exception as e:
         print(f"[CENTRAL-RIEGO] Aviso: no se pudieron crear los topics ({e})")
 
+def latido():
+    while True:
+        try:
+            producer.send(TOPIC_RESPUESTAS, key="CENTRAL", value={"tipo": "LATIDO", "ts": time.time()})
+        except Exception:
+            pass
+        time.sleep(2)
 
 def iniciar_kafka(broker):
     global producer
@@ -394,6 +403,7 @@ def iniciar_kafka(broker):
     crear_topics(broker)
     threading.Thread(target=bucle_kafka, args=(broker,), daemon=True).start()
     threading.Thread(target=vigilar_timeouts, daemon=True).start()
+    threading.Thread(target=latido, daemon=True).start()
 
 # =========================================================================
 # FUNCIONES DE ADMINISTRACIÓN CENTRAL (Punto 11)

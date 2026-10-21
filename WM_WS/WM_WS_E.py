@@ -20,6 +20,8 @@ import signal
 import os
 from kafka import KafkaProducer, KafkaConsumer
 from kafka.errors import NoBrokersAvailable
+import logging
+logging.getLogger("kafka").addHandler(logging.NullHandler())
 
 simular_fuga = False
 monitor_conectado = False
@@ -29,9 +31,10 @@ TOPIC_TELEMETRIA = "wm_telemetria"   # Engine -> Central y operarios
 TOPIC_ORDENES = "wm_ordenes"         # Central -> Engine
 TOPIC_SOLICITUDES = "wm_solicitudes" # Engine -> Central (riego manual desde la estación)
 TOPIC_RESPUESTAS = "wm_respuestas"   # Central -> quien pidió el riego
-MAX_ANTIGUEDAD_ORDEN = 4            # s: órdenes más viejas se ignoran
+MAX_ANTIGUEDAD_ORDEN = 4             # s: órdenes más viejas se ignoran
 producer = None   # se crea en el main, cuando ya sabemos el ws_id
 ws_id = None      # nos lo envía el Monitor al conectarnos
+ultimo_latido = time.time()
 DIR_DATOS = os.path.join(os.path.dirname(os.path.abspath(__file__)), "datos")
 
 
@@ -208,6 +211,7 @@ def keyboard_listener():
 def escuchar_ordenes(broker):
     """Hilo consumidor: obedece las órdenes para esta estación y muestra las
     respuestas de CENTRAL a los riegos manuales pedidos desde aquí."""
+    global ultimo_latido
     consumer = KafkaConsumer(
         bootstrap_servers=[broker],
         group_id=f"wm_engine_{ws_id}",   # un grupo propio por estación
@@ -223,7 +227,9 @@ def escuchar_ordenes(broker):
                 orden = msg.value
                 if msg.topic == TOPIC_RESPUESTAS:
                     # Solo nos interesan las respuestas a NUESTRAS peticiones manuales
-                    if orden.get("op_id") == f"MANUAL-{ws_id}":
+                    if orden.get("tipo") == "LATIDO":
+                        ultimo_latido = time.time()
+                    elif orden.get("op_id") == f"MANUAL-{ws_id}":
                         print(f"[ENGINE] CENTRAL ({orden.get('tipo')}): {orden.get('mensaje')}")
                     continue
                 if orden.get("ws_id") != ws_id:
@@ -231,6 +237,19 @@ def escuchar_ordenes(broker):
                 if time.time() - orden.get("ts", 0) > MAX_ANTIGUEDAD_ORDEN:
                     continue        # orden caducada
                 procesar_orden(orden)
+
+
+def vigilar_central():
+    caida = False
+    while True:
+        time.sleep(1)
+        if time.time() - ultimo_latido > 6:
+            if not caida:
+                print("\n[ENGINE] ✖ Imposible conectar con WM_Central / gestor de colas.")
+                caida = True
+        elif caida:
+            print("\n[ENGINE] ✔ WM_Central vuelve a estar disponible.")
+            caida = False
 
 
 def procesar_orden(orden):
@@ -331,6 +350,7 @@ if __name__ == "__main__":
                 value_serializer=lambda v: json.dumps(v).encode("utf-8"),
                 acks="all",
                 retries=5,
+                max_block_ms=3000,
             )
         except NoBrokersAvailable:
             print(f"[ENGINE] Error: no hay ningún Kafka escuchando en {broker}")
@@ -340,6 +360,8 @@ if __name__ == "__main__":
 
         #Hilo que escucha las órdenes de Central
         threading.Thread(target=escuchar_ordenes, args=(broker,), daemon=True).start()
+        ultimo_latido = time.time()
+        threading.Thread(target=vigilar_central, daemon=True).start()
 
         #A partir de aquí, cerrar la ventana cierra la válvula de forma ordenada
         instalar_cierre_ventana()
