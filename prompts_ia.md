@@ -187,3 +187,103 @@
 
 > "¿Qué apartados esenciales debe contener una guía técnica de despliegue para una memoria de Sistemas Distribuidos con arquitectura híbrida (nube y local)? ¿Cómo se documenta de forma rigurosa la secuencia de construcción, las variables de entorno, la topología de red y las incidencias de ejecución resueltas durante el despliegue?"  
 > **Propósito:** Elaborar el borrador formal del apartado de despliegue para la memoria del proyecto, detallando la configuración del contenedor, volúmenes de datos y el protocolo de verificación extremo a extremo.
+
+## Semana 4: Resiliencia, Pruebas de Estrés y Depuración
+
+### Diagnóstico de desconexión de clientes con el broker Kafka desplegado en Railway
+
+**Fecha:** 21 de octubre de 2026  
+**Prompt:**
+
+> "Desde que me he bajado los últimos cambios, al conectar WM_WS_E y WM_FO al Kafka de Railway me sale '✖ Imposible conectar con WM_Central / gestor de colas', aunque el Monitor sí se autentica con Central por sockets. ¿Es por algo del código nuevo o por una configuración mal puesta?"  
+> **Propósito:** Identificar que los clientes esperan ahora el mensaje `LATIDO` que Central publica en `wm_respuestas`, y que la Central desplegada en Railway seguía ejecutando una versión anterior por tener los builds pausados durante una incidencia de la plataforma.
+
+---
+
+### Timeout en el pulso de salud entre Monitor y Engine
+
+**Fecha:** 21 de octubre de 2026  
+**Prompt:**
+
+> "El Monitor tiene que avisar si el Engine cae o no responde. ¿Cómo añado un timeout al recv del pulso de salud para que, si el Engine se cuelga sin cerrar el socket, el Monitor no se quede bloqueado y la estación pase a ROJO en Central?"  
+> **Propósito:** Aplicar `settimeout` al socket del Engine en `health_pulse_worker` (`WM_WS_M.py`), capturando `socket.timeout` antes que `OSError` y unificando el aviso a Central en `reportar_averia` para los casos de KO, timeout y cierre de conexión.
+
+---
+
+### Error Broken pipe al reanudar un Engine congelado
+
+**Fecha:** 21 de octubre de 2026  
+**Prompt:**
+
+> "Al congelar el Engine con Ctrl+Z y reanudarlo con fg, el programa se cierra con 'Desconexión: [Errno 32] Broken pipe' en vez de reconectarse al Monitor. ¿Por qué pasa y cómo lo arreglo?"  
+> **Propósito:** Entender que el Engine leía un `HEALTH?` pendiente en el buffer y fallaba al responder sobre un socket ya cerrado por el Monitor; se captura `OSError` en el `sendall` de `WM_WS_E.py` para que el siguiente `recv` detecte el cierre y active `reconectar_monitor`.
+
+---
+
+### Notificación de avería resuelta y respeto del bloqueo administrativo
+
+**Fecha:** 21 de octubre de 2026  
+**Prompt:**
+
+> "El Monitor tiene que seguir vigilando después de un KO y, cuando vuelva el OK, enviar ALERT#RESUELTA para que Central ponga la estación en verde. Además, si estaba bloqueada antes de la avería, al repararse no debería ponerse en verde. ¿Cómo lo organizo?"  
+> **Propósito:** Introducir la bandera `estacion_averiada` en `WM_WS_M.py` para avisar una sola vez y emitir `ALERT#RESUELTA`, y el conjunto `bloqueadas_con_averia` en `WM_Central.py` para devolver la estación a FUERA DE SERVICIO en lugar de DISPONIBLE cuando corresponda.
+
+---
+
+### Reconexión automática del Monitor ante la caída de Central
+
+**Fecha:** 23 de octubre de 2026  
+**Prompt:**
+
+> "¿Cómo hago que el Monitor se reconecte solo si Central se cae y vuelve, sin tener que reiniciarlo, y que si la estación seguía averiada Central lo sepa al reconectar?"  
+> **Propósito:** Crear `mantener_conexion_central` en `WM_WS_M.py`, que escucha el socket de Central, detecta la caída con `recv()` y reintenta cada 3 s con timeout de conexión, reenviando `ALERT#FUGA` tras el registro si la avería persiste.
+
+---
+
+### Estado inicial DESCONECTADA de todas las estaciones al arrancar Central
+
+**Fecha:** 23 de octubre de 2026  
+**Prompt:**
+
+> "Al reiniciar Central, las estaciones aparecen con el último estado guardado en SQLite (rojo, naranja...) aunque todavía no se ha conectado ningún Monitor. ¿Cómo hago que arranquen todas en gris como pide el enunciado?"  
+> **Propósito:** Añadir en `init_db()` (`db_manager.py`) un `UPDATE estaciones SET estado = 'DESCONECTADA'`, ya que `INSERT OR IGNORE` solo fija el estado la primera vez que se crea la estación.
+
+---
+
+### Coherencia de las órdenes bloquear/activar según el estado de la estación
+
+**Fecha:** 23 de octubre de 2026  
+**Prompt:**
+
+> "Al hacer 'bloquear all' se bloquean también las estaciones desconectadas, y con 'activar all' pasan a verde aunque no haya ningún Monitor. Según el enunciado, ¿sobre qué estados deberían actuar estas órdenes? ¿Y cómo muestro en el Monitor las órdenes ORDEN#BLOQUEAR y ORDEN#ACTIVAR que le manda Central?"  
+> **Propósito:** Restringir `admin_activar_estacion` a estaciones FUERA DE SERVICIO y `admin_bloquear_estacion` a DISPONIBLE/REGANDO (anotando las AVERIADAS para bloquearlas al repararse), devolviendo un resumen al panel; y procesar en `WM_WS_M.py` las órdenes de Central línea a línea con un buffer.
+
+---
+
+### Diseño y ejecución de pruebas de estrés sobre sockets
+
+**Fecha:** 23 de octubre de 2026  
+**Prompt:**
+
+> "Tengo que diseñar y ejecutar pruebas de estrés sobre sockets: cortes abruptos de conexión entre Monitor y Central, reconexiones en caliente y saturación de peticiones concurrentes, contra la Central desplegada en Railway. ¿Qué pruebas hago y cómo las automatizo?"  
+> **Propósito:** Definir la batería de pruebas (Ctrl+C, `kill -9`, `kill -STOP`, reinicio de Central en Railway, IDs duplicados) y crear `pruebas/estres_sockets.py` para lanzar conexiones simultáneas, tramas basura, cortes con RST y conexiones ociosas. Se detectaron dos fallos: Central no detecta un Monitor congelado y un ID duplicado provoca una desconexión incorrecta.
+
+---
+
+### Latido del Monitor hacia Central para detectar cortes sin cierre
+
+**Fecha:** 23 de octubre de 2026  
+**Prompt:**
+
+> "Si congelo el Monitor con kill -STOP, Central sigue mostrando la estación como DISPONIBLE para siempre. ¿Cómo hago que Central detecte un Monitor colgado o una red cortada sin cierre y la marque como DESCONECTADA?"  
+> **Propósito:** Diseñar un latido `PING` cada 2 s desde `WM_WS_M.py` y un timeout de 6 s en el `recv()` de `handle_monitor_client` (`WM_Central.py`), delimitando las tramas con `\n` para que los PING y las alertas no se mezclen en el mismo socket.
+
+---
+
+### Integridad y persistencia de SQLite ante caídas del servidor
+
+**Fecha:** 23 de octubre de 2026  
+**Prompt:**
+
+> "¿Cómo compruebo la integridad de SQLite ante caídas del servidor y que las transacciones y estados persistan correctamente, tanto en local como en Railway?"  
+> **Propósito:** Matar Central con `kill -9` durante escrituras concurrentes y verificar con `PRAGMA integrity_check` que la base de datos no se corrompe y conserva el último estado escrito, y confirmar que en Railway la BD reside en el volumen montado en `/app/data`.
