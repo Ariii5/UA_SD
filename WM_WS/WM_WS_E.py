@@ -393,11 +393,16 @@ if __name__ == "__main__":
                 continue
 
             if data == b"HEALTH?":
-                if simular_fuga:
-                    sock.sendall(b"KO")
-                    print("[ENGINE] Enviado: KO -> Avería reportada.")
-                else:
-                    sock.sendall(b"OK")
+                try:
+                    if simular_fuga:
+                        sock.sendall(b"KO")
+                        print("[ENGINE] Enviado: KO -> Avería reportada.")
+                    else:
+                        sock.sendall(b"OK")
+                except OSError:
+                    # El Monitor ya cerró el socket (p. ej. nos dio por muertos por timeout).
+                    # No salimos: en la siguiente vuelta recv() devolverá b"" y se reconecta.
+                    continue
     except ConnectionRefusedError:
         print(f"[ENGINE] Error: El Monitor no está escuchando en {ip_monitor}:{puerto_monitor}")
     except KeyboardInterrupt:

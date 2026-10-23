@@ -11,37 +11,70 @@ NACK = b'\x15'  #Error
 # Variables globales para compartir los sockets entre hilos
 sock_central_global = None
 
+TIMEOUT_PULSO = 3   # segundos máximos esperando la respuesta del Engine
+estacion_averiada = False   # True desde que avisamos de una avería hasta que se resuelve
 
-#El Monitor escucha y vigila a su propio motor local WM_WS_E
+
+def avisar_central(ws_id, trama):
+    """Envía una trama de estado a Central por el socket ya autenticado."""
+    if not sock_central_global:
+        print(f"[{ws_id} - CLIENTE] Sin conexión con Central: no se puede enviar '{trama}'.")
+        return
+    try:
+        print(f"[{ws_id} - CLIENTE] Enviando '{trama}' a WM_Central...")
+        sock_central_global.sendall(trama.encode("utf-8"))
+    except OSError as e:
+        print(f"[{ws_id} - CLIENTE] No se pudo avisar a Central: {e}")
+
+
+def reportar_averia(ws_id, motivo):
+    """Primera vez que se detecta el fallo: avisa a Central (ROJO). Si ya estaba avisado, no repite."""
+    global estacion_averiada
+    if estacion_averiada:
+        return
+    estacion_averiada = True
+    print(f"\n[{ws_id} - ALERTA] {motivo}")
+    avisar_central(ws_id, "ALERT#FUGA")
+
+
+def reportar_resuelta(ws_id):
+    """El Engine vuelve a responder OK tras una avería: avisa a Central (VERDE)."""
+    global estacion_averiada
+    if not estacion_averiada:
+        return
+    estacion_averiada = False
+    print(f"\n[{ws_id} - SALUD] El Engine vuelve a responder OK. Avería resuelta.")
+    avisar_central(ws_id, "ALERT#RESUELTA")
+
+
 def health_pulse_worker(engine_socket, ws_id):
-    """
-    Hilo dedicado a vigilar la salud del Engine cada segundo.
-    Si el Engine responde KO, notifica de inmediato a Central vía Socket.
-    """
-    global sock_central_global
     print(f"[{ws_id} - SALUD] Iniciando monitoreo periódico cada 1s con el Engine...")
-    
+    engine_socket.settimeout(TIMEOUT_PULSO)   # el recv ya no puede bloquearse para siempre
+
     while True:
         time.sleep(1)
         try:
-            # Enviamos la pregunta de salud al motor
             engine_socket.sendall(b"HEALTH?")
-            respuesta = engine_socket.recv(1024) # se queda esperando que conteste
-            
-            if respuesta == b"KO":
-                print(f"\n[{ws_id} - ALERTA] ¡El Engine ha respondido KO (avería/fuga)!")
-                if sock_central_global:
-                    print(f"[{ws_id} - CLIENTE] Reportando 'ALERT#FUGA' a WM_Central...")
-                    sock_central_global.sendall(b"ALERT#FUGA")
-                break  # Paramos el pulso tras detectar el fallo
-            elif respuesta != b"OK":
-                if not respuesta:
-                    print(f"[{ws_id} - SALUD] El Engine ha cerrado la conexión.")
-                    break
-                print(f"[{ws_id} - SALUD] Respuesta desconocida del Engine: {respuesta}")
-        except Exception as e:
-            print(f"[{ws_id} - SALUD] Error en el pulso con el Engine: {e}")
+            respuesta = engine_socket.recv(1024)
+        except socket.timeout:
+            reportar_averia(ws_id, f"El Engine no responde en {TIMEOUT_PULSO}s.")
             break
+        except OSError as e:
+            reportar_averia(ws_id, f"Conexión con el Engine perdida ({e}).")
+            break
+
+        if respuesta == b"OK":
+            reportar_resuelta(ws_id)      # solo hace algo si veníamos de una avería
+            continue
+        if respuesta == b"KO":
+            reportar_averia(ws_id, "¡El Engine ha respondido KO (avería/fuga)!")
+            continue                      # seguimos vigilando para detectar la reparación
+        if not respuesta:
+            reportar_averia(ws_id, "El Engine ha cerrado la conexión.")
+            break
+        print(f"[{ws_id} - SALUD] Respuesta desconocida del Engine: {respuesta}")
+
+    engine_socket.close()
 
 #se ejecuta en el instante que el motor WM_WSE se conecta al puerto 5001
 def handle_engine_connection(engine_socket, engine_address, ws_id):
@@ -82,6 +115,7 @@ def connect_to_central(central_ip, central_port, ws_id, ubicacion):
     try:
         #crea el socket local
         client_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        client_sock.settimeout(5)
         #marca el destno e inicia la conexión de tres vías
         client_sock.connect((central_ip, central_port))
         print(f"[{ws_id} - CLIENTE] Conexión física establecida. Enviando <ENQ>...")
@@ -102,6 +136,7 @@ def connect_to_central(central_ip, central_port, ws_id, ubicacion):
         reg_response = client_sock.recv(1024)
         if reg_response == ACK:
             print(f"[{ws_id} - CLIENTE] ¡Autenticación OK! Estación registrada en Central como DISPONIBLE.")
+            client_sock.settimeout(None) 
             #asigna el socket abierto a sock_central_global
             sock_central_global = client_sock
             #devuelve el obketo del socket
@@ -117,6 +152,53 @@ def connect_to_central(central_ip, central_port, ws_id, ubicacion):
     except Exception as e:
         print(f"[{ws_id} - CLIENTE] Error en la comunicación con Central: {e}")
         return None
+
+def procesar_mensaje_central(ws_id, mensaje):
+    if not mensaje:
+        return
+    if mensaje == "ORDEN#BLOQUEAR":
+        print(f"\n[{ws_id} - CENTRAL] ⛔ ORDEN#BLOQUEAR recibida: la estación pasa a FUERA DE SERVICIO por orden de Central.")
+    elif mensaje == "ORDEN#ACTIVAR":
+        print(f"\n[{ws_id} - CENTRAL] ✅ ORDEN#ACTIVAR recibida: la estación vuelve a estar ACTIVADA (disponible).")
+    else:
+        print(f"\n[{ws_id} - CENTRAL] Mensaje desconocido de Central: {mensaje}")
+
+REINTENTO_CENTRAL = 3   # segundos entre intentos de reconexión con Central
+
+
+def mantener_conexion_central(central_ip, central_port, ws_id, ubicacion):
+    global sock_central_global
+    while True:
+        sock = connect_to_central(central_ip, central_port, ws_id, ubicacion)
+        if sock is None:
+            print(f"[{ws_id} - CLIENTE] Reintentando conexión con Central en {REINTENTO_CENTRAL}s...")
+            time.sleep(REINTENTO_CENTRAL)
+            continue
+
+        print(f"[{ws_id}] Canal con Central abierto y listo. Pulsa Ctrl+C para finalizar.\n")
+        if estacion_averiada:
+            # Central nos acaba de registrar como DISPONIBLE, pero la avería sigue: se lo recordamos
+            avisar_central(ws_id, "ALERT#FUGA")
+
+        # Escuchamos a Central. Mientras siga viva, recv se queda esperando;
+        # si se cae, recv devuelve b"" (cierre) o lanza un error (conexión reseteada).
+        buffer = ""
+        try:
+            while True:
+                datos = sock.recv(1024)
+                if not datos:
+                    break
+                buffer += datos.decode("utf-8", "replace")
+                # Central termina cada orden con "\n": procesamos las líneas completas
+                while "\n" in buffer:
+                    linea, buffer = buffer.split("\n", 1)
+                    procesar_mensaje_central(ws_id, linea.strip())
+        except OSError:
+            pass
+
+        print(f"\n[{ws_id} - CLIENTE] ✖ Conexión con WM_Central perdida.")
+        sock_central_global = None   # mientras tanto, avisar_central no intentará enviar
+        sock.close()
 
 if __name__ == "__main__":
     if len(sys.argv) < 7:
@@ -144,15 +226,10 @@ if __name__ == "__main__":
     )
     engine_server_thread.start()
 
-    #Conectarse y registrarse en Central
-    sock_central = connect_to_central(ip_central, puerto_central, ws_id, ubicacion)
-
-    #Mantener el proceso vivo
+        #Conectarse a Central y mantener la conexión (reconecta solo si Central se cae)
     try:
-        if sock_central:
-            print(f"[{ws_id}] Canal con Central abierto y listo. Pulsa Ctrl+C para finalizar.\n")
-        engine_server_thread.join()
+        mantener_conexion_central(ip_central, puerto_central, ws_id, ubicacion)
     except KeyboardInterrupt:
         print(f"\n[{ws_id}] Monitor detenido manualmente.")
-        if sock_central:
-            sock_central.close()
+        if sock_central_global:
+            sock_central_global.close()

@@ -60,6 +60,8 @@ def colorear_estado(estado: str) -> str:
 # Registro de sockets activos hacia los Monitores {ws_id: client_socket}
 lock_monitores = threading.Lock()
 monitores_conectados = {}
+bloqueadas_con_averia = set()
+
 
 def notificar_monitor(ws_id: str, orden: str):
     """Envía una orden al monitor de una estación por socket (si está conectado)."""
@@ -118,8 +120,23 @@ def handle_monitor_client(client_socket, client_address):
 
             texto = msg.decode('utf-8').strip()
             if texto == "ALERT#FUGA":
+                if get_estado_estacion(ws_id) == "FUERA DE SERVICIO":
+                    bloqueadas_con_averia.add(ws_id)   # recordar que estaba bloqueada
                 actualizar_estado_estacion(ws_id, "AVERIADA")
                 print(f"\n[ALERTA CRÍTICA] ¡Avería/Fuga detectada en {ws_id}! -> Estado en BD: AVERIADA\n")
+
+            elif texto == "ALERT#RESUELTA":
+                estado = get_estado_estacion(ws_id)
+                if estado == "AVERIADA":
+                    if ws_id in bloqueadas_con_averia:
+                        bloqueadas_con_averia.discard(ws_id)
+                        nuevo = "FUERA DE SERVICIO"
+                    else:
+                        nuevo = "DISPONIBLE"
+                    actualizar_estado_estacion(ws_id, nuevo)
+                    print(f"\n[CENTRAL] Avería resuelta en {ws_id} -> Estado en BD: {nuevo}\n")
+                else:
+                    print(f"[CENTRAL] {ws_id} avisa de avería resuelta, pero está en {estado}: no se cambia.")
 
     except Exception as e:
         print(f"[CENTRAL] Incidencia con {ws_id or client_address}: {e}")
@@ -443,32 +460,68 @@ def admin_forzar_riego(ws_id: str, duracion: int = 20, publicar_mensaje=None):
 
 
 def admin_bloquear_estacion(ws_id: str):
-    """Opción 'Bloquear la WS' (Punto 11): para riegos en curso y pone FUERA DE SERVICIO (naranja)."""
     estaciones = get_estaciones()
     destinos = [e[0] for e in estaciones] if ws_id.lower() == "all" else [ws_id]
 
+    bloqueadas, en_averia, rechazadas = [], [], []
     for target in destinos:
         estado = get_estado_estacion(target)
-        with lock_riegos:
-            riego_activo = target in activos
 
-        if estado == "REGANDO" or riego_activo:
-            ordenar_cierre(target, motivo="BLOQUEO_ADMIN_CENTRAL")
+        if estado in ("DISPONIBLE", "REGANDO"):
+            with lock_riegos:
+                riego_activo = target in activos
+            if estado == "REGANDO" or riego_activo:
+                ordenar_cierre(target, motivo="BLOQUEO_ADMIN_CENTRAL")
+            actualizar_estado_estacion(target, "FUERA DE SERVICIO")
+            notificar_monitor(target, "ORDEN#BLOQUEAR")
+            bloqueadas.append(target)
 
-        # 2. Marcamos en BD como FUERA DE SERVICIO
-        actualizar_estado_estacion(target, "FUERA DE SERVICIO")
+        elif estado == "AVERIADA":
+            bloqueadas_con_averia.add(target)   # al resolverse la fuga quedará en NARANJA
+            notificar_monitor(target, "ORDEN#BLOQUEAR")
+            en_averia.append(target)
 
-        # 3. Notificamos al monitor por socket si está conectado
-        notificar_monitor(target, "ORDEN#BLOQUEAR")
-        print(f"[ADMIN] Estación {target} BLOQUEADA -> Estado: FUERA DE SERVICIO")
+        else:
+            rechazadas.append(f"{target} ({estado or 'no existe'})")
+
+    resultado = []
+    if bloqueadas:
+        resultado.append(f"Bloqueadas: {', '.join(bloqueadas)}.")
+    if en_averia:
+        resultado.append(f"Siguen en ROJO por avería; quedarán bloqueadas al repararse: {', '.join(en_averia)}.")
+    if rechazadas:
+        resultado.append(f"No se bloquean: {', '.join(rechazadas)}.")
+    return "[ADMIN] " + " ".join(resultado)
 
 
 def admin_activar_estacion(ws_id: str):
+    estaciones = get_estaciones()
+    destinos = [e[0] for e in estaciones] if ws_id.lower() == "all" else [ws_id]
+
+    activadas, rechazadas = [], []
+    for target in destinos:
+        estado = get_estado_estacion(target)
+        if estado != "FUERA DE SERVICIO":
+            rechazadas.append(f"{target} ({estado or 'no existe'})")
+            continue
+
+        bloqueadas_con_averia.discard(target)
+        actualizar_estado_estacion(target, "DISPONIBLE")
+        notificar_monitor(target, "ORDEN#ACTIVAR")
+        activadas.append(target)
+
+    resultado = []
+    if activadas:
+        resultado.append(f"Activadas: {', '.join(activadas)}.")
+    if rechazadas:
+        resultado.append(f"No se activan (no están FUERA DE SERVICIO): {', '.join(rechazadas)}.")
+    return "[ADMIN] " + " ".join(resultado)
     """Opción 'Activar la WS' (Punto 11): vuelve a estado ACTIVADA/DISPONIBLE (verde)."""
     estaciones = get_estaciones()
     destinos = [e[0] for e in estaciones] if ws_id.lower() == "all" else [ws_id]
 
     for target in destinos:
+        bloqueadas_con_averia.discard(target)
         # Volvemos a DISPONIBLE en BD
         actualizar_estado_estacion(target, "DISPONIBLE")
 
@@ -539,11 +592,9 @@ def ejecutar_comando_admin(command: str, publicar_mensaje):
                 return
             admin_forzar_riego(partes[1].upper(), int(partes[2]), publicar_mensaje)
         elif accion == "bloquear" and len(partes) == 2:
-            admin_bloquear_estacion(partes[1].upper())
-            publicar_mensaje(f"[ADMIN] Estación {partes[1].upper()} bloqueada.")
+            publicar_mensaje(admin_bloquear_estacion(partes[1].upper()))
         elif accion == "activar" and len(partes) == 2:
-            admin_activar_estacion(partes[1].upper())
-            publicar_mensaje(f"[ADMIN] Estación {partes[1].upper()} activada.")
+            publicar_mensaje(admin_activar_estacion(partes[1].upper()))
         else:
             publicar_mensaje(
                 "[ADMIN] Uso: regar <WS_ID|all> <segundos>, "

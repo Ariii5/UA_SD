@@ -47,6 +47,8 @@ def init_db():
         "INSERT OR IGNORE INTO operarios (id, nombre) VALUES (?, ?)", 
         operarios_iniciales
     )
+
+    cursor.execute("UPDATE estaciones SET estado = 'DESCONECTADA'")
     
     conn.commit()
     conn.close()
