@@ -13,6 +13,11 @@ import time
 import uuid
 import socket
 import threading
+import os
+import hmac
+import base64
+import collections
+import http.server
 from kafka import KafkaProducer, KafkaConsumer
 from kafka.errors import NoBrokersAvailable
 from prompt_toolkit.application import Application
@@ -605,6 +610,10 @@ def ejecutar_comando_admin(command: str, publicar_mensaje):
 
 
 def ejecutar_consola_admin():
+    # La consola debe dibujar directamente en la terminal real (no a través del
+    # registro de mensajes del panel web, o los dibujos acabarían en la web)
+    terminal_real = sys.stdout.destino if isinstance(sys.stdout, SalidaConRegistro) else sys.stdout
+    sys.stdout = terminal_real
     entrada = TextArea(height=1, prompt="> ", multiline=False)
     atajos = KeyBindings()
     mensaje_admin = [" "]
@@ -655,18 +664,382 @@ def ejecutar_consola_admin():
     )
     app_ref[0] = app
 
-    with patch_stdout():
-        app.run()
+    try:
+        with patch_stdout():
+            # patch_stdout cambia sys.stdout: lo envolvemos para que el panel web siga
+            # recibiendo los mensajes mientras la consola está abierta
+            sys.stdout = SalidaConRegistro(sys.stdout)
+            app.run()
+    finally:
+        sys.stdout = SalidaConRegistro(terminal_real)
+
+
+# =========================================================================
+# PANEL WEB (para controlar CENTRAL cuando corre en Railway sin terminal)
+# =========================================================================
+# CENTRAL sirve una página web con el estado de las estaciones en tiempo real y
+# botones para regar, bloquear y activar. La página pregunta el estado cada
+# segundo a /api/estado y manda las órdenes a /api/comando, que reutiliza
+# exactamente las mismas funciones que la consola (ejecutar_comando_admin).
+#
+# Seguridad: si existe la variable de entorno WM_PANEL_PASSWORD, el navegador
+# pedirá usuario y contraseña (cualquier usuario + esa contraseña).
+
+# Últimos mensajes de la aplicación, para mostrarlos en el panel web
+lock_log = threading.Lock()
+log_mensajes = collections.deque(maxlen=60)
+
+
+class SalidaConRegistro:
+    """Sustituye a sys.stdout: cada línea que imprime cualquier hilo se sigue
+    escribiendo donde iba (terminal / logs de Railway) y además se guarda en
+    log_mensajes para que el panel web la muestre."""
+    def __init__(self, destino):
+        self.destino = destino
+        self.pendiente = ""
+
+    def write(self, texto):
+        try:
+            self.destino.write(texto)
+        except Exception:
+            pass
+        self.pendiente += texto
+        while "\n" in self.pendiente:
+            linea, self.pendiente = self.pendiente.split("\n", 1)
+            linea = linea.strip()
+            if linea and not linea.startswith(("=====", "-----")):
+                with lock_log:
+                    log_mensajes.append(f"[{time.strftime('%H:%M:%S')}] {linea}")
+        return len(texto)
+
+    def flush(self):
+        try:
+            self.destino.flush()
+        except Exception:
+            pass
+
+    def isatty(self):
+        try:
+            return self.destino.isatty()
+        except Exception:
+            return False
+
+    def __getattr__(self, nombre):          # encoding, fileno... los da el destino real
+        return getattr(self.destino, nombre)
+
+
+def estado_para_web():
+    """Todo lo que necesita la página: estaciones con su telemetría y mensajes."""
+    telemetria = obtener_telemetria()
+    estaciones = []
+    for ws_id, ubicacion, estado in get_estaciones():
+        tele = telemetria.get(ws_id, {}) if estado == "REGANDO" else {}
+        estaciones.append({
+            "id": ws_id, "ubicacion": ubicacion, "estado": estado,
+            "caudal": round(float(tele.get("caudal") or 0.0), 2),
+            "volumen": round(float(tele.get("volumen") or 0.0), 2),
+            "operario": tele.get("op_id") or "-",
+        })
+    with lock_log:
+        mensajes = list(log_mensajes)[-25:]
+    return {"hora": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "kafka": producer is not None,
+            "estaciones": estaciones, "mensajes": mensajes}
+
+
+def ejecutar_comando_web(datos):
+    """Traduce el botón pulsado a un comando de la consola y devuelve sus mensajes."""
+    accion = str(datos.get("accion", "")).lower()
+    ws_id = str(datos.get("ws_id", "")).strip().upper() or "ALL"
+    if accion not in ("regar", "bloquear", "activar"):
+        return ["[ADMIN] Acción no válida."]
+    if ws_id != "ALL" and get_estado_estacion(ws_id) is None:
+        return [f"[ADMIN] La estación {ws_id} no existe."]
+    comando = f"{accion} {ws_id}"
+    if accion == "regar":
+        try:
+            segundos = int(datos.get("segundos", 20))
+        except (TypeError, ValueError):
+            return ["[ADMIN] Los segundos deben ser un número."]
+        if not 1 <= segundos <= 3600:
+            return ["[ADMIN] Los segundos deben estar entre 1 y 3600."]
+        comando += f" {segundos}"
+    respuestas = []
+    ejecutar_comando_admin(comando, respuestas.append)
+    for r in respuestas:
+        print(f"[WEB] {r}")
+    return respuestas or [f"[ADMIN] Comando '{comando}' ejecutado."]
+
+
+PAGINA_PANEL = r"""<!doctype html>
+<html lang="es">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>WaterManagement · Central</title>
+<style>
+  :root { --fondo:#0b1418; --panel:#11202a; --borde:#1f3542; --texto:#d7e6ec; --suave:#7f99a6;
+          --verde:#34c77b; --rojo:#ef5350; --naranja:#f39c35; --gris:#7d8b93; --acento:#4fb3d9; }
+  * { box-sizing:border-box; }
+  body { margin:0; background:var(--fondo); color:var(--texto);
+         font-family:"Segoe UI",system-ui,-apple-system,sans-serif; }
+  header { display:flex; flex-wrap:wrap; gap:12px; align-items:center; justify-content:space-between;
+           padding:16px 22px; border-bottom:1px solid var(--borde); }
+  .marca small { display:block; color:var(--suave); font-size:11px; letter-spacing:2px; }
+  .marca b { font-size:20px; } .marca span { color:var(--suave); font-weight:400; }
+  .resumen { display:flex; flex-wrap:wrap; gap:8px; }
+  .chip { padding:4px 11px; border-radius:999px; border:1px solid var(--borde); font-size:13px; }
+  .chip i { display:inline-block; width:9px; height:9px; border-radius:50%; margin-right:6px; }
+  main { display:grid; grid-template-columns:minmax(0,1fr) 360px; gap:18px; padding:18px 22px; }
+  @media (max-width:900px){ main { grid-template-columns:1fr; } }
+  .caja { background:var(--panel); border:1px solid var(--borde); border-radius:12px; padding:14px; }
+  .caja h2 { margin:0 0 12px; font-size:12px; letter-spacing:2px; color:var(--suave); font-weight:600; }
+  .estaciones { display:grid; grid-template-columns:repeat(auto-fill,minmax(250px,1fr)); gap:12px; }
+  .ws { border:1px solid var(--borde); border-left:6px solid var(--gris); border-radius:10px;
+        padding:12px; background:#0e1b23; }
+  .ws .cab { display:flex; justify-content:space-between; align-items:baseline; }
+  .ws .id { font-weight:700; font-size:16px; } .ws .ubi { color:var(--suave); font-size:13px; }
+  .estado { display:inline-block; margin:8px 0; padding:3px 10px; border-radius:6px; font-weight:700;
+            font-size:12px; letter-spacing:1px; color:#0b1418; background:var(--gris); }
+  .datos { display:grid; grid-template-columns:repeat(3,1fr); gap:6px; font-size:12px; color:var(--suave); }
+  .datos b { display:block; color:var(--texto); font-size:15px; }
+  .acciones { display:flex; flex-wrap:wrap; gap:6px; margin-top:10px; align-items:center; }
+  button { cursor:pointer; border:1px solid var(--borde); background:#16303d; color:var(--texto);
+           border-radius:7px; padding:6px 10px; font-size:13px; }
+  button:hover { border-color:var(--acento); } button:disabled { opacity:.4; cursor:not-allowed; }
+  button.regar { border-color:#246b48; } button.bloquear { border-color:#7a4d1d; } button.activar { border-color:#246b48; }
+  input[type=number] { width:62px; background:#0b1418; color:var(--texto); border:1px solid var(--borde);
+                       border-radius:7px; padding:6px; font-size:13px; }
+  .DISPONIBLE { border-left-color:var(--verde); } .DISPONIBLE .estado { background:var(--verde); }
+  .REGANDO { border-left-color:var(--verde); } .REGANDO .estado { background:var(--verde); animation:parpadeo 1s steps(2,start) infinite; }
+  .REGANDO { box-shadow:0 0 0 1px rgba(52,199,123,.35); }
+  .AVERIADA { border-left-color:var(--rojo); } .AVERIADA .estado { background:var(--rojo); }
+  .FUERA { border-left-color:var(--naranja); } .FUERA .estado { background:var(--naranja); }
+  .DESCONECTADA .estado { background:var(--gris); }
+  @keyframes parpadeo { to { opacity:.25; } }
+  .todas { display:flex; flex-wrap:wrap; gap:8px; align-items:center; margin-bottom:12px; }
+  #mensajes { font-family:ui-monospace,Menlo,Consolas,monospace; font-size:12px; line-height:1.5;
+              max-height:60vh; overflow-y:auto; white-space:pre-wrap; word-break:break-word; }
+  #mensajes div { border-bottom:1px solid #15262f; padding:2px 0; }
+  .alerta { color:#ff8a80; } .ok { color:#8ee0b0; } .admin { color:#9fd3ea; }
+  #respuesta { min-height:20px; font-size:13px; color:#9fd3ea; margin-bottom:10px; }
+  footer { padding:0 22px 18px; color:var(--suave); font-size:12px; }
+  .desconexion { color:var(--rojo) !important; font-weight:700; }
+</style>
+</head>
+<body>
+<header>
+  <div class="marca"><small>SAMPLE CITY · PARKS &amp; GARDENS NETWORK</small>
+    <b>WaterManagement <span>· Panel de control de Central</span></b></div>
+  <div class="resumen" id="resumen"></div>
+</header>
+<main>
+  <section class="caja">
+    <h2>ESTACIONES DE RIEGO</h2>
+    <div class="todas">
+      <span>Todas las estaciones:</span>
+      <input type="number" id="seg-all" min="1" max="3600" value="20" title="segundos">
+      <button class="regar" onclick="orden('regar','ALL','seg-all')">💧 Regar todas</button>
+      <button class="bloquear" onclick="orden('bloquear','ALL')">⛔ Bloquear todas</button>
+      <button class="activar" onclick="orden('activar','ALL')">✅ Activar todas</button>
+    </div>
+    <div id="respuesta"></div>
+    <div class="estaciones" id="estaciones"></div>
+  </section>
+  <aside class="caja">
+    <h2>MENSAJES DE LA APLICACIÓN</h2>
+    <div id="mensajes"></div>
+  </aside>
+</main>
+<footer id="pie">Conectando con Central…</footer>
+<script>
+const COLORES = {DISPONIBLE:"var(--verde)", REGANDO:"var(--verde)", AVERIADA:"var(--rojo)",
+                 "FUERA DE SERVICIO":"var(--naranja)", DESCONECTADA:"var(--gris)"};
+const TEXTO = {DISPONIBLE:"DISPONIBLE", REGANDO:"REGANDO", AVERIADA:"AVERIADA / FUGA",
+               "FUERA DE SERVICIO":"FUERA DE SERVICIO", DESCONECTADA:"DESCONECTADA"};
+const segundos = {};   // conserva lo que el usuario escribe en cada estación entre refrescos
+
+function clase(estado){ return estado === "FUERA DE SERVICIO" ? "FUERA" : estado; }
+
+function el(tag, attrs = {}, hijos = []) {
+  const e = document.createElement(tag);
+  for (const [k, v] of Object.entries(attrs)) {
+    if (k === "text") e.textContent = v; else if (k.startsWith("on")) e[k] = v; else e.setAttribute(k, v);
+  }
+  hijos.forEach(h => e.appendChild(h));
+  return e;
+}
+
+function pintar(datos) {
+  // Resumen por estado
+  const cuenta = {};
+  datos.estaciones.forEach(s => cuenta[s.estado] = (cuenta[s.estado] || 0) + 1);
+  const resumen = document.getElementById("resumen"); resumen.replaceChildren();
+  Object.keys(TEXTO).forEach(est => {
+    const chip = el("span", {class:"chip"}, [el("i", {style:`background:${COLORES[est]}`})]);
+    chip.appendChild(document.createTextNode(`${cuenta[est] || 0} ${TEXTO[est].toLowerCase()}`));
+    resumen.appendChild(chip);
+  });
+
+  // Tarjetas de estaciones
+  const cont = document.getElementById("estaciones");
+  const enfocado = document.activeElement && document.activeElement.id;
+  cont.replaceChildren();
+  datos.estaciones.forEach(s => {
+    const idSeg = "seg-" + s.id;
+    const regando = s.estado === "REGANDO";
+    const input = el("input", {type:"number", id:idSeg, min:"1", max:"3600", title:"segundos"});
+    input.value = segundos[s.id] || 20;
+    input.oninput = () => segundos[s.id] = input.value;
+    const tarjeta = el("div", {class:"ws " + clase(s.estado)}, [
+      el("div", {class:"cab"}, [el("span", {class:"id", text:s.id}), el("span", {class:"ubi", text:s.ubicacion})]),
+      el("span", {class:"estado", text:TEXTO[s.estado] || s.estado}),
+      el("div", {class:"datos"}, [
+        el("div", {}, [document.createTextNode("Caudal"), el("b", {text: s.caudal.toFixed(2) + " l/min"})]),
+        el("div", {}, [document.createTextNode("Volumen"), el("b", {text: s.volumen.toFixed(2) + " l"})]),
+        el("div", {}, [document.createTextNode("Operario"), el("b", {text: s.operario})]),
+      ]),
+      el("div", {class:"acciones"}, [
+        input,
+        el("button", {class:"regar", onclick: () => orden("regar", s.id, idSeg)}, [document.createTextNode("💧 Regar")]),
+        el("button", {class:"bloquear", onclick: () => orden("bloquear", s.id)}, [document.createTextNode("⛔ Bloquear")]),
+        el("button", {class:"activar", onclick: () => orden("activar", s.id)}, [document.createTextNode("✅ Activar")]),
+      ]),
+    ]);
+    cont.appendChild(tarjeta);
+  });
+  if (enfocado && document.getElementById(enfocado)) document.getElementById(enfocado).focus();
+
+  // Mensajes (los más recientes arriba)
+  const caja = document.getElementById("mensajes"); caja.replaceChildren();
+  datos.mensajes.slice().reverse().forEach(m => {
+    let c = "";
+    if (/ALERTA|DENEGADO|desconectad|Error|✖/i.test(m)) c = "alerta";
+    else if (/autenticada|resuelta|AUTORIZADO|REGANDO/i.test(m)) c = "ok";
+    else if (/ADMIN|WEB/.test(m)) c = "admin";
+    caja.appendChild(el("div", {class:c, text:m}));
+  });
+
+  document.getElementById("pie").className = "";
+  document.getElementById("pie").textContent =
+    `Última actualización: ${datos.hora} · Kafka: ${datos.kafka ? "conectado" : "NO disponible"} · se refresca cada segundo`;
+}
+
+async function refrescar() {
+  try {
+    const r = await fetch("/api/estado", {cache:"no-store"});
+    if (!r.ok) throw new Error(r.status);
+    pintar(await r.json());
+  } catch (e) {
+    const pie = document.getElementById("pie");
+    pie.className = "desconexion";
+    pie.textContent = "✖ Sin conexión con WM_Central. Reintentando…";
+  }
+}
+
+async function orden(accion, ws_id, idSegundos) {
+  const cuerpo = {accion, ws_id};
+  if (idSegundos) cuerpo.segundos = Number(document.getElementById(idSegundos).value || 20);
+  const resp = document.getElementById("respuesta");
+  resp.textContent = `Enviando '${accion}' a ${ws_id === "ALL" ? "todas" : ws_id}…`;
+  try {
+    const r = await fetch("/api/comando", {method:"POST", headers:{"Content-Type":"application/json"},
+                                           body: JSON.stringify(cuerpo)});
+    const datos = await r.json();
+    resp.textContent = (datos.mensajes || []).join("  ·  ");
+  } catch (e) {
+    resp.textContent = "✖ No se pudo enviar la orden a Central.";
+  }
+  refrescar();
+}
+
+refrescar();
+setInterval(refrescar, 1000);
+</script>
+</body>
+</html>
+"""
+
+
+class ManejadorPanelWeb(http.server.BaseHTTPRequestHandler):
+    def log_message(self, formato, *args):
+        pass   # sin esto, cada petición (una por segundo) llenaría los logs
+
+    def _autorizado(self):
+        clave = os.environ.get("WM_PANEL_PASSWORD")
+        if not clave:
+            return True
+        cabecera = self.headers.get("Authorization", "")
+        if cabecera.startswith("Basic "):
+            try:
+                _, _, enviada = base64.b64decode(cabecera[6:]).decode("utf-8").partition(":")
+                if hmac.compare_digest(enviada, clave):
+                    return True
+            except Exception:
+                pass
+        self.send_response(401)
+        self.send_header("WWW-Authenticate", 'Basic realm="WM_Central"')
+        self.end_headers()
+        return False
+
+    def _responder(self, codigo, tipo, cuerpo):
+        datos = cuerpo.encode("utf-8")
+        self.send_response(codigo)
+        self.send_header("Content-Type", tipo)
+        self.send_header("Content-Length", str(len(datos)))
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        self.wfile.write(datos)
+
+    def do_GET(self):
+        if not self._autorizado():
+            return
+        if self.path in ("/", "/index.html"):
+            self._responder(200, "text/html; charset=utf-8", PAGINA_PANEL)
+        elif self.path == "/favicon.ico":
+            self.send_response(204)
+            self.end_headers()
+        elif self.path.startswith("/api/estado"):
+            self._responder(200, "application/json", json.dumps(estado_para_web()))
+        else:
+            self._responder(404, "text/plain; charset=utf-8", "No encontrado")
+
+    def do_POST(self):
+        if not self._autorizado():
+            return
+        if self.path != "/api/comando":
+            self._responder(404, "text/plain; charset=utf-8", "No encontrado")
+            return
+        try:
+            longitud = min(int(self.headers.get("Content-Length", 0)), 10_000)
+            datos = json.loads(self.rfile.read(longitud) or b"{}")
+            mensajes = ejecutar_comando_web(datos)
+            self._responder(200, "application/json", json.dumps({"mensajes": mensajes}))
+        except Exception as e:
+            self._responder(400, "application/json", json.dumps({"mensajes": [f"[ADMIN ERROR] {e}"]}))
+
+
+def iniciar_panel_web(puerto):
+    servidor = http.server.ThreadingHTTPServer(("0.0.0.0", puerto), ManejadorPanelWeb)
+    servidor.daemon_threads = True
+    proteccion = "con contraseña" if os.environ.get("WM_PANEL_PASSWORD") else "SIN contraseña"
+    print(f"[CENTRAL-WEB] Panel web en http://0.0.0.0:{puerto} ({proteccion})")
+    servidor.serve_forever()
 
 
 if __name__ == "__main__":
     if len(sys.argv) < 3:
-        print("Uso: python3 WM_Central.py <puerto_sockets> <ip_kafka:puerto>")
-        print("Ejemplo: python3 WM_Central.py 8000 localhost:9092")
+        print("Uso: python3 WM_Central.py <puerto_sockets> <ip_kafka:puerto> [puerto_web]")
+        print("Ejemplo: python3 WM_Central.py 8000 localhost:9092 8080")
         sys.exit(1)
 
     socket_port = int(sys.argv[1])
     kafka_server = sys.argv[2]
+    # Puerto del panel web: 3er argumento, o variable WM_WEB_PORT, o 8080 por defecto
+    web_port = int(sys.argv[3]) if len(sys.argv) > 3 else int(os.environ.get("WM_WEB_PORT", 8080))
+
+    # Todo lo que se imprima a partir de aquí también llega al panel web
+    sys.stdout = SalidaConRegistro(sys.stdout)
 
     print("=" * 50)
     print("      INICIANDO SISTEMA WM_CENTRAL")
@@ -682,6 +1055,9 @@ if __name__ == "__main__":
 
     # 1. Servidor de sockets (hilo daemon)
     threading.Thread(target=start_socket_server, args=(socket_port,), daemon=True).start()
+
+    # 2. Panel web (hilo daemon): estado en tiempo real + botones regar/bloquear/activar
+    threading.Thread(target=iniciar_panel_web, args=(web_port,), daemon=True).start()
 
     # En Mac con terminal abre el panel; en Railway (Docker) mantiene el servidor sin TTY
     # Modo servidor cloud automático si no hay TTY o si prompt_toolkit falla al registrar el teclado
