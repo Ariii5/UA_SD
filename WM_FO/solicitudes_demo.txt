@@ -1,0 +1,40 @@
+# =====================================================================
+#  Fichero de demostración para WM_FO - modo fichero (opción 3 del menú)
+# =====================================================================
+#  Formato de cada petición:   <ID_ESTACION>,<DURACION_EN_SEGUNDOS>
+#  Las líneas vacías y las que empiezan por # se ignoran.
+#  El operario envía una petición, espera a que termine (éxito o fracaso)
+#  y espera 4 segundos antes de pasar a la siguiente (lo exige el enunciado).
+#
+#  ANTES DE EJECUTARLO:
+#   - WS-01, WS-02 y WS-03 conectadas (Monitor + Engine), en VERDE.
+#   - WS-04 SIN arrancar (para que salga DESCONECTADA).
+#   - Panel web abierto para ver los riegos y poder bloquear.
+# =====================================================================
+
+# --- 1. Riegos normales en estaciones disponibles -> AUTORIZADO + resumen
+WS-01,5
+WS-02,5
+WS-03,5
+
+# --- 2. Estación que no existe en la base de datos -> DENEGADO
+WS-99,5
+
+# --- 3. Líneas con formato incorrecto -> se ignoran al leer el fichero
+#        (el operario avisa al cargarlo: "Línea N ignorada")
+WS-01;5
+WS-02,cinco
+
+# --- 4. Estación dada de alta pero sin Monitor conectado -> DENEGADO (DESCONECTADA)
+WS-04,5
+
+# --- 5. Riego largo: mientras riega, pulsa "Bloquear" en WS-02 desde el panel web
+#        -> el riego se corta y el resumen indica motivo BLOQUEO_ADMIN_CENTRAL
+WS-02,20
+
+# --- 6. Pedir la estación que se acaba de bloquear (NO la actives todavía)
+#        -> DENEGADO: no está disponible (FUERA DE SERVICIO)
+WS-02,5
+
+# --- 7. Riego final en otra estación para comprobar que el sistema sigue funcionando
+WS-03,5
