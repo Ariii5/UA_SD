@@ -32,6 +32,7 @@ TOPIC_ORDENES = "wm_ordenes"         # Central -> Engine
 TOPIC_SOLICITUDES = "wm_solicitudes" # Engine -> Central (riego manual desde la estación)
 TOPIC_RESPUESTAS = "wm_respuestas"   # Central -> quien pidió el riego
 MAX_ANTIGUEDAD_ORDEN = 4             # s: órdenes más viejas se ignoran
+desfase_central = 0.0                # s que nuestro reloj va por delante del de CENTRAL (se mide con su LATIDO)
 producer = None   # se crea en el main, cuando ya sabemos el ws_id
 ws_id = None      # nos lo envía el Monitor al conectarnos
 ultimo_latido = time.time()
@@ -211,7 +212,7 @@ def keyboard_listener():
 def escuchar_ordenes(broker):
     """Hilo consumidor: obedece las órdenes para esta estación y muestra las
     respuestas de CENTRAL a los riegos manuales pedidos desde aquí."""
-    global ultimo_latido
+    global ultimo_latido, desfase_central
     consumer = KafkaConsumer(
         bootstrap_servers=[broker],
         group_id=f"wm_engine_{ws_id}",   # un grupo propio por estación
@@ -220,6 +221,15 @@ def escuchar_ordenes(broker):
         value_deserializer=lambda b: json.loads(b.decode("utf-8")),
     )
     consumer.subscribe([TOPIC_ORDENES, TOPIC_RESPUESTAS])
+    # Al arrancar, ignoramos las órdenes que se quedaron en Kafka con el Engine apagado
+    # (no hay que abrir la válvula por un ABRIR de hace rato)
+    limite = time.time() + 30
+    while not consumer.assignment() and time.time() < limite:
+        consumer.poll(timeout_ms=200)
+    if consumer.assignment():
+        consumer.seek_to_end(*consumer.assignment())
+        for tp in consumer.assignment():
+            consumer.position(tp)
     while True:
         lotes = consumer.poll(timeout_ms=500)
         for registros in lotes.values():
@@ -229,12 +239,17 @@ def escuchar_ordenes(broker):
                     # Solo nos interesan las respuestas a NUESTRAS peticiones manuales
                     if orden.get("tipo") == "LATIDO":
                         ultimo_latido = time.time()
+                        # El LATIDO lleva la hora de CENTRAL: así sabemos cuánto se
+                        # desvía nuestro reloj del suyo (incluye unas décimas de red)
+                        desfase_central = time.time() - orden.get("ts", time.time())
                     elif orden.get("op_id") == f"MANUAL-{ws_id}":
                         print(f"[ENGINE] CENTRAL ({orden.get('tipo')}): {orden.get('mensaje')}")
                     continue
                 if orden.get("ws_id") != ws_id:
                     continue        # la orden es para otra estación
-                if time.time() - orden.get("ts", 0) > MAX_ANTIGUEDAD_ORDEN:
+                # Antigüedad medida con la hora de CENTRAL (nuestro reloj corregido por
+                # el desfase), para que un PC con la hora mal no descarte órdenes buenas
+                if (time.time() - desfase_central) - orden.get("ts", 0) > MAX_ANTIGUEDAD_ORDEN:
                     continue        # orden caducada
                 procesar_orden(orden)
 

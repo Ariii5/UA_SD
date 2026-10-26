@@ -190,7 +190,6 @@ TOPIC_TELEMETRIA = "wm_telemetria"     # Engine -> CENTRAL/Operario: INICIO, TEL
 
 TIMEOUT_APERTURA = 5    # s que esperamos a que el Engine confirme la apertura (INICIO)
 TIMEOUT_SIN_NOTICIAS = 8  # s sin telemetría de un riego en curso -> se da por terminado
-MAX_ANTIGUEDAD = 30   # s: peticiones más viejas se descartan (p.ej. Central estaba caída)
 
 producer = None
 lock_riegos = threading.Lock()
@@ -354,6 +353,23 @@ def vigilar_timeouts():
                                duracion=a["transcurrido"], litros=a["volumen"])
 
 
+def saltar_mensajes_antiguos(consumer):
+    """Al arrancar, CENTRAL ignora lo que se quedó en Kafka mientras estaba caída
+    (peticiones viejas que los operarios ya habrán dado por perdidas).
+    Antes se hacía comparando el campo 'ts' del mensaje con la hora de CENTRAL,
+    pero 'ts' lo pone el reloj del ordenador que envía: si ese reloj va desfasado
+    (p.ej. un PC del laboratorio con 1 hora de retraso), CENTRAL descartaba TODAS
+    sus peticiones. Saltando al final de los topics no dependemos de ningún reloj."""
+    limite = time.time() + 30
+    while not consumer.assignment() and time.time() < limite:
+        consumer.poll(timeout_ms=200)      # lo que llegue aquí es antiguo: se descarta
+    particiones = consumer.assignment()
+    if particiones:
+        consumer.seek_to_end(*particiones)
+        for tp in particiones:
+            consumer.position(tp)           # fija ya la posición "final"
+
+
 #Bucle consumidor
 def bucle_kafka(broker):
     # Un único consumidor para peticiones y telemetría: todas las decisiones se toman
@@ -366,6 +382,7 @@ def bucle_kafka(broker):
         value_deserializer=lambda b: json.loads(b.decode("utf-8")),
     )
     consumer.subscribe([TOPIC_SOLICITUDES, TOPIC_TELEMETRIA])
+    saltar_mensajes_antiguos(consumer)
     print(f"[CENTRAL-RIEGO] Escuchando '{TOPIC_SOLICITUDES}' y '{TOPIC_TELEMETRIA}' en {broker}")
     while True:
         lotes = consumer.poll(timeout_ms=500)
@@ -374,8 +391,6 @@ def bucle_kafka(broker):
                 m = msg.value
                 try:
                     if msg.topic == TOPIC_SOLICITUDES:
-                        if time.time() - m.get("ts", 0) > MAX_ANTIGUEDAD:
-                            continue   # petición caducada
                         if m.get("tipo") == "SOLICITUD":
                             procesar_solicitud(m)
                         elif m.get("tipo") == "LISTAR":
