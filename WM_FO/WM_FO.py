@@ -216,22 +216,31 @@ def listar_estaciones():
 def leer_fichero(ruta):
     """Devuelve una lista de (ws_id, duracion) a partir del fichero de peticiones."""
     peticiones = []
-    with open(ruta, encoding="utf-8") as f:
-        for n, linea in enumerate(f, 1):
-            linea = linea.strip()
-            if not linea or linea.startswith("#"):
-                continue
-            try:
-                ws_id, duracion = [p.strip() for p in linea.split(",")]
-                peticiones.append((ws_id, int(duracion)))
-            except ValueError:
-                print(f"[FO {op_id}] Línea {n} ignorada (formato esperado WS-01,15): {linea!r}")
+    # Windows añade comillas al copiar una ruta: las quitamos
+    ruta = ruta.strip().strip('"').strip("'")
+    try:
+        with open(ruta, encoding="utf-8") as f:
+            for n, linea in enumerate(f, 1):
+                linea = linea.strip()
+                if not linea or linea.startswith("#"):
+                    continue
+                try:
+                    ws_id, duracion = [p.strip() for p in linea.split(",")]
+                    peticiones.append((ws_id.upper(), int(duracion)))
+                except ValueError:
+                    print(f"[FO {op_id}] Línea {n} ignorada (formato esperado WS-01,15): {linea!r}")
+    except OSError as e:
+        # Ruta mal escrita, fichero inexistente o sin permisos: avisamos y seguimos
+        print(f"[FO {op_id}] ✖ No se puede abrir el fichero '{ruta}': {e.strerror or e}")
+        return None
     return peticiones
 
 
 def modo_fichero(ruta):
     peticiones = leer_fichero(ruta)
-    print(f"[FO {op_id}] {len(peticiones)} peticiones cargadas de {ruta}")
+    if peticiones is None:
+        return
+    print(f"[FO {op_id}] {len(peticiones)} peticiones cargadas de {ruta.strip().strip(chr(34)).strip(chr(39))}")
     for i, (ws_id, duracion) in enumerate(peticiones, 1):
         print(f"\n[FO {op_id}] ---- Servicio {i}/{len(peticiones)} ----")
         ok = solicitar_riego(ws_id, duracion)

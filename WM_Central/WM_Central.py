@@ -13,6 +13,7 @@ import time
 import uuid
 import socket
 import threading
+import re
 import os
 import hmac
 import base64
@@ -78,11 +79,46 @@ def notificar_monitor(ws_id: str, orden: str):
         except Exception:
             pass
 
+TIMEOUT_MONITOR = 6     # s sin recibir nada del Monitor (ni PING) -> DESCONECTADA
+TIMEOUT_HANDSHAKE = 10  # s máximos para completar ENQ + REG; si no, se cierra la conexión
+
+
+def procesar_trama_monitor(ws_id, texto):
+    """Interpreta una trama recibida del Monitor ya autenticado."""
+    if texto == "PING":
+        return   # latido: solo sirve para saber que el Monitor sigue vivo
+
+    if texto == "ALERT#FUGA":
+        if get_estado_estacion(ws_id) == "FUERA DE SERVICIO":
+            bloqueadas_con_averia.add(ws_id)   # recordar que estaba bloqueada
+        actualizar_estado_estacion(ws_id, "AVERIADA")
+        print(f"\n[ALERTA CRÍTICA] ¡Avería/Fuga detectada en {ws_id}! -> Estado en BD: AVERIADA\n")
+
+    elif texto == "ALERT#RESUELTA":
+        estado = get_estado_estacion(ws_id)
+        if estado == "AVERIADA":
+            if ws_id in bloqueadas_con_averia:
+                bloqueadas_con_averia.discard(ws_id)
+                nuevo = "FUERA DE SERVICIO"
+            else:
+                nuevo = "DISPONIBLE"
+            actualizar_estado_estacion(ws_id, nuevo)
+            print(f"\n[CENTRAL] Avería resuelta en {ws_id} -> Estado en BD: {nuevo}\n")
+        else:
+            print(f"[CENTRAL] {ws_id} avisa de avería resuelta, pero está en {estado}: no se cambia.")
+
+    elif texto:
+        print(f"[CENTRAL] Trama desconocida de {ws_id}: {texto!r}")
+
+
 #cada vez que un Monitor se conecta a la central el servidor principal geenera un hilo que ejecuta la funciòn exclusiva para esa conexión
 def handle_monitor_client(client_socket, client_address):
     ws_id = None
     print(f"\n[CENTRAL] Conexión TCP entrante desde {client_address}") #client address--> tupla de la IP y puerto
     try:
+        # Si en TIMEOUT_HANDSHAKE s no completa el saludo y el registro, se cierra:
+        # una conexión que no dice nada no puede tener un hilo ocupado para siempre.
+        client_socket.settimeout(TIMEOUT_HANDSHAKE)
         #Handshake inicial
         data = client_socket.recv(1024)#hilo se pausa hasta que llegan bytes por la red
         if data != ENQ:
@@ -103,9 +139,18 @@ def handle_monitor_client(client_socket, client_address):
             ubicacion = partes[2]
 
             if autenticar_estacion(ws_id, ubicacion):
-                actualizar_estado_estacion(ws_id, "DISPONIBLE")
                 with lock_monitores:
-                    monitores_conectados[ws_id] = client_socket  # <--- GUARDAR AQUÍ
+                    duplicado = ws_id in monitores_conectados
+                    if not duplicado:
+                        monitores_conectados[ws_id] = client_socket  # <--- GUARDAR AQUÍ
+                if duplicado:
+                    # Ya hay un Monitor vivo con este ID: no dejamos que otro lo suplante.
+                    # (Si el anterior estaba colgado, el latido lo da por muerto en
+                    # TIMEOUT_MONITOR s y el nuevo entrará en su siguiente reintento.)
+                    client_socket.sendall(NACK)
+                    print(f"[CENTRAL] Rechazado: ya hay un Monitor conectado como {ws_id}.")
+                    return
+                actualizar_estado_estacion(ws_id, "DISPONIBLE")
                 client_socket.sendall(ACK)
                 print(f"[CENTRAL] Estación {ws_id} ({ubicacion}) autenticada con éxito -> Estado: DISPONIBLE")
             else:
@@ -116,41 +161,39 @@ def handle_monitor_client(client_socket, client_address):
             client_socket.sendall(NACK)
             return
 
-        #Mantener la escucha de alertas mientras la estación siga viva
+        #Mantener la escucha de alertas mientras la estación siga viva.
+        #El Monitor manda un PING cada 2 s: si en TIMEOUT_MONITOR s no llega nada
+        #(Monitor colgado, red cortada sin cierre...), la damos por DESCONECTADA.
+        client_socket.settimeout(TIMEOUT_MONITOR)
+        buffer = ""
         while True:
-            #el hilo se queda escuchando sin gastar ciclos
-            msg = client_socket.recv(1024)
+            try:
+                msg = client_socket.recv(1024)
+            except socket.timeout:
+                print(f"\n[CENTRAL] {ws_id} no da señales de vida en {TIMEOUT_MONITOR}s. Se da por desconectada.")
+                break
             if not msg:
                 break
 
-            texto = msg.decode('utf-8').strip()
-            if texto == "ALERT#FUGA":
-                if get_estado_estacion(ws_id) == "FUERA DE SERVICIO":
-                    bloqueadas_con_averia.add(ws_id)   # recordar que estaba bloqueada
-                actualizar_estado_estacion(ws_id, "AVERIADA")
-                print(f"\n[ALERTA CRÍTICA] ¡Avería/Fuga detectada en {ws_id}! -> Estado en BD: AVERIADA\n")
-
-            elif texto == "ALERT#RESUELTA":
-                estado = get_estado_estacion(ws_id)
-                if estado == "AVERIADA":
-                    if ws_id in bloqueadas_con_averia:
-                        bloqueadas_con_averia.discard(ws_id)
-                        nuevo = "FUERA DE SERVICIO"
-                    else:
-                        nuevo = "DISPONIBLE"
-                    actualizar_estado_estacion(ws_id, nuevo)
-                    print(f"\n[CENTRAL] Avería resuelta en {ws_id} -> Estado en BD: {nuevo}\n")
-                else:
-                    print(f"[CENTRAL] {ws_id} avisa de avería resuelta, pero está en {estado}: no se cambia.")
+            buffer += msg.decode('utf-8', 'replace')
+            # Cada trama del Monitor termina en "\n": procesamos las completas
+            while "\n" in buffer:
+                texto, buffer = buffer.split("\n", 1)
+                procesar_trama_monitor(ws_id, texto.strip())
 
     except Exception as e:
         print(f"[CENTRAL] Incidencia con {ws_id or client_address}: {e}")
     finally:
         if ws_id:
             with lock_monitores:
-                monitores_conectados.pop(ws_id, None)  # <--- ELIMINAR AQUÍ
-            actualizar_estado_estacion(ws_id, "DESCONECTADA")
-            print(f"[CENTRAL] Estación {ws_id} desconectada -> Estado: DESCONECTADA\n")
+                # Solo si ESTE socket sigue siendo el registrado: si la estación ya se ha
+                # vuelto a conectar por otro socket, cerrar este no debe desconectarla.
+                es_el_actual = monitores_conectados.get(ws_id) is client_socket
+                if es_el_actual:
+                    monitores_conectados.pop(ws_id, None)  # <--- ELIMINAR AQUÍ
+            if es_el_actual:
+                actualizar_estado_estacion(ws_id, "DESCONECTADA")
+                print(f"[CENTRAL] Estación {ws_id} desconectada -> Estado: DESCONECTADA\n")
         client_socket.close()
 
 
@@ -166,7 +209,7 @@ def start_socket_server(port):
     #enlaza el socket a una interfaz física y a un puerto. Al poner 0.0.0.0 le ordena que escuche en todas las tarjetas e interfaces de red del equipo
     server.bind(("0.0.0.0", port))
     #pone el socket en modo de escucha pasiva
-    server.listen(5)
+    server.listen(50)   # cola de conexiones pendientes (con 5, en ráfagas se rechazaban)
     print(f"[CENTRAL] Servidor de Sockets a la escucha en el puerto {port}...")
 
     while True:
@@ -301,8 +344,14 @@ def procesar_evento_ws(ev):
         motivo = ev.get("motivo")
         estado_actual = get_estado_estacion(ws_id)
 
+        # Solo cambiamos el estado si es un riego que CENTRAL tenía en curso. Un FIN de
+        # un riego que no conocemos (p.ej. terminó con CENTRAL caída) solo genera el
+        # resumen para el operario: el estado real de la estación ya lo da su Monitor.
+        if not act:
+            pass
+
         # 1. Si el motivo fue una fuga detectada durante el riego
-        if motivo == "FUGA":
+        elif motivo == "FUGA":
             actualizar_estado_estacion(ws_id, "AVERIADA")
 
         # 2. Si el motivo fue el bloqueo del Administrador o ya estaba marcada como FUERA DE SERVICIO
@@ -332,25 +381,30 @@ def vigilar_timeouts():
       perdido) -> se da por terminado. Si no, la estación quedaría "ocupada" para siempre."""
     while True:
         time.sleep(1)
-        ahora = time.time()
-        with lock_riegos:
-            caducados = [(ws, p) for ws, p in pendientes.items()
-                         if ahora - p["enviado"] > TIMEOUT_APERTURA]
-            for ws, _ in caducados:
-                del pendientes[ws]
-            perdidos = [(ws, a) for ws, a in activos.items()
-                        if ahora - a["ultimo"] > TIMEOUT_SIN_NOTICIAS]
-            for ws, _ in perdidos:
-                del activos[ws]
-        for ws, p in caducados:
-            denegar(p["sol"], f"{ws} no ha respondido a la orden de apertura")
-        for ws, a in perdidos:
-            if get_estado_estacion(ws) == "REGANDO":
-                actualizar_estado_estacion(ws, "DISPONIBLE")
-            print(f"[CENTRAL-RIEGO] {ws}: sin noticias del riego en {TIMEOUT_SIN_NOTICIAS}s. Se da por terminado.")
-            responder_operario("RESUMEN", a["sol"], f"Sin noticias de {ws}: riego dado por terminado",
-                               motivo="SIN_NOTICIAS_ESTACION",
-                               duracion=a["transcurrido"], litros=a["volumen"])
+        try:
+            ahora = time.time()
+            with lock_riegos:
+                caducados = [(ws, p) for ws, p in pendientes.items()
+                             if ahora - p["enviado"] > TIMEOUT_APERTURA]
+                for ws, _ in caducados:
+                    del pendientes[ws]
+                perdidos = [(ws, a) for ws, a in activos.items()
+                            if ahora - a["ultimo"] > TIMEOUT_SIN_NOTICIAS]
+                for ws, _ in perdidos:
+                    del activos[ws]
+            for ws, p in caducados:
+                denegar(p["sol"], f"{ws} no ha respondido a la orden de apertura")
+            for ws, a in perdidos:
+                if get_estado_estacion(ws) == "REGANDO":
+                    actualizar_estado_estacion(ws, "DISPONIBLE")
+                print(f"[CENTRAL-RIEGO] {ws}: sin noticias del riego en {TIMEOUT_SIN_NOTICIAS}s. Se da por terminado.")
+                responder_operario("RESUMEN", a["sol"], f"Sin noticias de {ws}: riego dado por terminado",
+                                   motivo="SIN_NOTICIAS_ESTACION",
+                                   duracion=a["transcurrido"], litros=a["volumen"])
+        except Exception as e:
+            # Si Kafka está caído, enviar() lanza excepción: sin este try el hilo
+            # moriría y Central dejaría de vigilar los timeouts para siempre.
+            print(f"[CENTRAL-RIEGO] Error vigilando timeouts (se reintenta): {e}")
 
 
 def saltar_mensajes_antiguos(consumer):
@@ -360,14 +414,22 @@ def saltar_mensajes_antiguos(consumer):
     pero 'ts' lo pone el reloj del ordenador que envía: si ese reloj va desfasado
     (p.ej. un PC del laboratorio con 1 hora de retraso), CENTRAL descartaba TODAS
     sus peticiones. Saltando al final de los topics no dependemos de ningún reloj."""
+    # OJO: solo se saltan las PETICIONES. La telemetría (INICIO/FIN de riegos) se
+    # sigue leyendo desde donde se quedó: si un riego terminó con CENTRAL caída, su
+    # FIN está ahí y hay que procesarlo para mandar el resumen al operario
+    # (la guía exige que no se pierda ninguna transacción).
+    telemetria_previa = []
     limite = time.time() + 30
     while not consumer.assignment() and time.time() < limite:
-        consumer.poll(timeout_ms=200)      # lo que llegue aquí es antiguo: se descarta
-    particiones = consumer.assignment()
-    if particiones:
-        consumer.seek_to_end(*particiones)
-        for tp in particiones:
+        lotes = consumer.poll(timeout_ms=200)
+        for registros in lotes.values():
+            telemetria_previa += [r for r in registros if r.topic == TOPIC_TELEMETRIA]
+    solicitudes = [tp for tp in consumer.assignment() if tp.topic == TOPIC_SOLICITUDES]
+    if solicitudes:
+        consumer.seek_to_end(*solicitudes)
+        for tp in solicitudes:
             consumer.position(tp)           # fija ya la posición "final"
+    return telemetria_previa
 
 
 #Bucle consumidor
@@ -382,10 +444,19 @@ def bucle_kafka(broker):
         value_deserializer=lambda b: json.loads(b.decode("utf-8")),
     )
     consumer.subscribe([TOPIC_SOLICITUDES, TOPIC_TELEMETRIA])
-    saltar_mensajes_antiguos(consumer)
+    for msg in saltar_mensajes_antiguos(consumer):
+        try:
+            procesar_evento_ws(msg.value)
+        except Exception as e:
+            print(f"[CENTRAL-RIEGO] Error procesando {msg.value}: {e}")
     print(f"[CENTRAL-RIEGO] Escuchando '{TOPIC_SOLICITUDES}' y '{TOPIC_TELEMETRIA}' en {broker}")
     while True:
-        lotes = consumer.poll(timeout_ms=500)
+        try:
+            lotes = consumer.poll(timeout_ms=500)
+        except Exception as e:   # el broker se ha caído o no responde: reintentar
+            print(f"[CENTRAL-RIEGO] Error leyendo de Kafka (se reintenta): {e}")
+            time.sleep(2)
+            continue
         for registros in lotes.values():
             for msg in registros:
                 m = msg.value
@@ -596,7 +667,36 @@ def construir_panel():
     lineas.append(f" LEYENDA: {COLOR_VERDE}● Disponible{RESET}  {COLOR_VERDE}● Regando{RESET}  {COLOR_ROJO}● Averiada/Fuga{RESET}  {COLOR_NARANJA}● Fuera de Servicio{RESET}  {COLOR_GRIS}● Desconectada{RESET}")
     lineas.append("=================================================================================================================")
     lineas.append(" COMANDOS: regar <ID|all> <seg>  |  bloquear <ID|all>  |  activar <ID|all>")
+    lineas.append("           alta-ws <ID> <ubicación>  |  alta-fo <ID> <nombre>")
     return "\n".join(lineas)
+
+
+ID_VALIDO = re.compile(r"^[A-Z0-9_-]{1,20}$")
+
+
+def admin_alta_estacion(ws_id: str, ubicacion: str) -> str:
+    """Da de alta (o actualiza) una estación para que su Monitor pueda autenticarse.
+    La ubicación tiene que coincidir EXACTAMENTE con la que se pase al Monitor."""
+    ws_id = ws_id.strip().upper()
+    ubicacion = ubicacion.strip().strip('"').strip("'").strip()
+    if not ID_VALIDO.match(ws_id) or ws_id == "ALL":
+        return "[ADMIN] ID de estación no válido (letras, números, - o _; máx. 20)."
+    if not ubicacion or len(ubicacion) > 50 or "#" in ubicacion:
+        return "[ADMIN] Ubicación no válida (1-50 caracteres y sin '#')."
+    resultado = alta_estacion(ws_id, ubicacion)
+    return f"[ADMIN] Estación {ws_id} ({ubicacion}) {resultado}. Arranca su Monitor con esa misma ubicación."
+
+
+def admin_alta_operario(op_id: str, nombre: str) -> str:
+    """Da de alta (o actualiza) un operario para que Central acepte sus peticiones."""
+    op_id = op_id.strip().upper()
+    nombre = nombre.strip().strip('"').strip("'").strip()
+    if not ID_VALIDO.match(op_id) or op_id == "CENTRAL" or op_id.startswith("MANUAL-"):
+        return "[ADMIN] ID de operario no válido (letras, números, - o _; máx. 20)."
+    if not nombre or len(nombre) > 50:
+        return "[ADMIN] Nombre no válido (1-50 caracteres)."
+    resultado = alta_operario(op_id, nombre)
+    return f"[ADMIN] Operario {op_id} ({nombre}) {resultado}."
 
 
 def ejecutar_comando_admin(command: str, publicar_mensaje):
@@ -615,10 +715,15 @@ def ejecutar_comando_admin(command: str, publicar_mensaje):
             publicar_mensaje(admin_bloquear_estacion(partes[1].upper()))
         elif accion == "activar" and len(partes) == 2:
             publicar_mensaje(admin_activar_estacion(partes[1].upper()))
+        elif accion == "alta-ws" and len(partes) >= 3:
+            publicar_mensaje(admin_alta_estacion(partes[1], " ".join(partes[2:])))
+        elif accion == "alta-fo" and len(partes) >= 3:
+            publicar_mensaje(admin_alta_operario(partes[1], " ".join(partes[2:])))
         else:
             publicar_mensaje(
                 "[ADMIN] Uso: regar <WS_ID|all> <segundos>, "
-                "bloquear <WS_ID|all>, activar <WS_ID|all>"
+                "bloquear <WS_ID|all>, activar <WS_ID|all>, "
+                "alta-ws <WS_ID> <ubicación>, alta-fo <FO_ID> <nombre>"
             )
     except Exception as exc:
         publicar_mensaje(f"[ADMIN ERROR] {exc}")
@@ -765,6 +870,14 @@ def estado_para_web():
 def ejecutar_comando_web(datos):
     """Traduce el botón pulsado a un comando de la consola y devuelve sus mensajes."""
     accion = str(datos.get("accion", "")).lower()
+    if accion == "alta-ws":
+        respuesta = admin_alta_estacion(str(datos.get("id", "")), str(datos.get("texto", "")))
+        print(f"[WEB] {respuesta}")
+        return [respuesta]
+    if accion == "alta-fo":
+        respuesta = admin_alta_operario(str(datos.get("id", "")), str(datos.get("texto", "")))
+        print(f"[WEB] {respuesta}")
+        return [respuesta]
     ws_id = str(datos.get("ws_id", "")).strip().upper() or "ALL"
     if accion not in ("regar", "bloquear", "activar"):
         return ["[ADMIN] Acción no válida."]
@@ -823,6 +936,8 @@ PAGINA_PANEL = r"""<!doctype html>
            border-radius:7px; padding:6px 10px; font-size:13px; }
   button:hover { border-color:var(--acento); } button:disabled { opacity:.4; cursor:not-allowed; }
   button.regar { border-color:#246b48; } button.bloquear { border-color:#7a4d1d; } button.activar { border-color:#246b48; }
+  input[type=text] { background:#0b1418; color:var(--texto); border:1px solid var(--borde);
+                     border-radius:7px; padding:6px; font-size:13px; max-width:100%; }
   input[type=number] { width:62px; background:#0b1418; color:var(--texto); border:1px solid var(--borde);
                        border-radius:7px; padding:6px; font-size:13px; }
   .DISPONIBLE { border-left-color:var(--verde); } .DISPONIBLE .estado { background:var(--verde); }
@@ -860,6 +975,19 @@ PAGINA_PANEL = r"""<!doctype html>
     </div>
     <div id="respuesta"></div>
     <div class="estaciones" id="estaciones"></div>
+    <h2 style="margin-top:18px">DAR DE ALTA</h2>
+    <div class="todas">
+      <span>Estación:</span>
+      <input type="text" id="alta-ws-id" placeholder="WS-05" size="8">
+      <input type="text" id="alta-ws-texto" placeholder="Ubicación (ej. Parque Norte)" size="24">
+      <button onclick="alta('alta-ws','alta-ws-id','alta-ws-texto')">➕ Alta estación</button>
+    </div>
+    <div class="todas">
+      <span>Operario:</span>
+      <input type="text" id="alta-fo-id" placeholder="FO-03" size="8">
+      <input type="text" id="alta-fo-texto" placeholder="Nombre" size="24">
+      <button onclick="alta('alta-fo','alta-fo-id','alta-fo-texto')">➕ Alta operario</button>
+    </div>
   </section>
   <aside class="caja">
     <h2>MENSAJES DE LA APLICACIÓN</h2>
@@ -964,6 +1092,24 @@ async function orden(accion, ws_id, idSegundos) {
     resp.textContent = (datos.mensajes || []).join("  ·  ");
   } catch (e) {
     resp.textContent = "✖ No se pudo enviar la orden a Central.";
+  }
+  refrescar();
+}
+
+async function alta(accion, idCampo, idTexto) {
+  const cuerpo = {accion, id: document.getElementById(idCampo).value,
+                  texto: document.getElementById(idTexto).value};
+  const resp = document.getElementById("respuesta");
+  try {
+    const r = await fetch("/api/comando", {method:"POST", headers:{"Content-Type":"application/json"},
+                                           body: JSON.stringify(cuerpo)});
+    const datos = await r.json();
+    resp.textContent = (datos.mensajes || []).join("  ·  ");
+    if (/creada|creado|actualizada|actualizado/.test(resp.textContent)) {
+      document.getElementById(idCampo).value = ""; document.getElementById(idTexto).value = "";
+    }
+  } catch (e) {
+    resp.textContent = "✖ No se pudo enviar el alta a Central.";
   }
   refrescar();
 }

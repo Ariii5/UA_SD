@@ -13,6 +13,8 @@ sock_central_global = None
 
 TIMEOUT_PULSO = 3   # segundos máximos esperando la respuesta del Engine
 estacion_averiada = False   # True desde que avisamos de una avería hasta que se resuelve
+LATIDO_CENTRAL = 2          # s entre PING y PING a Central ("sigo vivo")
+lock_envio_central = threading.Lock()   # el pulso de salud y el latido envían desde hilos distintos
 
 
 def avisar_central(ws_id, trama):
@@ -22,9 +24,25 @@ def avisar_central(ws_id, trama):
         return
     try:
         print(f"[{ws_id} - CLIENTE] Enviando '{trama}' a WM_Central...")
-        sock_central_global.sendall(trama.encode("utf-8"))
+        with lock_envio_central:
+            sock_central_global.sendall((trama + "\n").encode("utf-8"))   # "\n" marca el fin de la trama
     except OSError as e:
         print(f"[{ws_id} - CLIENTE] No se pudo avisar a Central: {e}")
+
+
+def enviar_latidos():
+    """Hilo: manda PING a Central cada LATIDO_CENTRAL s mientras haya conexión.
+    Así Central puede detectar un Monitor colgado o una red cortada sin cierre
+    (la guía: 'Desconectado = Central no recibe ningún mensaje de vida del Monitor')."""
+    while True:
+        time.sleep(LATIDO_CENTRAL)
+        sock = sock_central_global
+        if sock:
+            try:
+                with lock_envio_central:
+                    sock.sendall(b"PING\n")
+            except OSError:
+                pass   # la caída la detecta mantener_conexion_central con su recv()
 
 
 def reportar_averia(ws_id, motivo):
@@ -225,6 +243,9 @@ if __name__ == "__main__":
         daemon=True
     )
     engine_server_thread.start()
+
+    #Latido periódico hacia Central
+    threading.Thread(target=enviar_latidos, daemon=True).start()
 
         #Conectarse a Central y mantener la conexión (reconecta solo si Central se cae)
     try:

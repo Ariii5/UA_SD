@@ -98,6 +98,40 @@ def get_estado_estacion(ws_id):
     conn.close()
     return fila[0] if fila else None
 
+def alta_estacion(ws_id, ubicacion):
+    """Da de alta una estación nueva (DESCONECTADA hasta que su Monitor se conecte)
+    o, si ya existe, actualiza su ubicación. Devuelve 'creada' o 'actualizada'."""
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    cursor.execute("SELECT id FROM estaciones WHERE id = ?", (ws_id,))
+    if cursor.fetchone():
+        cursor.execute("UPDATE estaciones SET ubicacion = ? WHERE id = ?", (ubicacion, ws_id))
+        resultado = "actualizada"
+    else:
+        cursor.execute("INSERT INTO estaciones (id, ubicacion, estado) VALUES (?, ?, 'DESCONECTADA')",
+                       (ws_id, ubicacion))
+        resultado = "creada"
+    conn.commit()
+    conn.close()
+    return resultado
+
+
+def alta_operario(op_id, nombre):
+    """Da de alta un operario nuevo o actualiza su nombre. Devuelve 'creado' o 'actualizado'."""
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    cursor.execute("SELECT id FROM operarios WHERE id = ?", (op_id,))
+    if cursor.fetchone():
+        cursor.execute("UPDATE operarios SET nombre = ? WHERE id = ?", (nombre, op_id))
+        resultado = "actualizado"
+    else:
+        cursor.execute("INSERT INTO operarios (id, nombre) VALUES (?, ?)", (op_id, nombre))
+        resultado = "creado"
+    conn.commit()
+    conn.close()
+    return resultado
+
+
 def existe_operario(op_id):
     """True si el operario está dado de alta en la BD."""
     conn = sqlite3.connect(DB_PATH)
