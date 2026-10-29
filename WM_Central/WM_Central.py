@@ -1,11 +1,18 @@
-#funciónn principal:
-# - estar siempre encendido a la escucha
-# - aceptar conexiones simultáneas de múltiples estaciones de riego (WM_WS_M)
-# - autenticarlas usando la base de datos SQLite
-# - Reaccionar de inmediato si alguna se avería
-# - (Kafka) recibir las peticiones de riego de los operarios, validar que la estación
-#esté disponible, ordenar la apertura al Engine, responder al operario y enviarle
-#el resumen final del riego
+# ============================================================
+#  WM_Central.py - Central del sistema de riego
+#
+#  Qué hace:
+#   - Servidor de sockets para los monitores de las estaciones: los registra
+#     (comprobándolos en SQLite), recibe sus PING y sus avisos de avería y
+#     les manda las órdenes de bloquear y activar
+#   - Kafka: recibe las peticiones de riego de los operarios, comprueba que
+#     la estación está disponible, le manda ABRIR al engine, sigue la
+#     telemetría y al final le manda el resumen al operario
+#   - Panel en la terminal (en local) y panel web (para Railway)
+#   - Comandos de administración: regar, bloquear, activar y dar de alta
+#
+#  Uso: python3 WM_Central.py <puerto_sockets> <ip_kafka:puerto> [puerto_web]
+# ============================================================
 import sys
 import json
 import io
@@ -31,24 +38,26 @@ from prompt_toolkit.patch_stdout import patch_stdout
 from prompt_toolkit.widgets import TextArea
 from db_manager import *
 import logging
-logging.getLogger("kafka").addHandler(logging.NullHandler())
+logging.getLogger("kafka").addHandler(logging.NullHandler())   # para que kafka-python no llene la pantalla de avisos
 
-ENQ = b'\x05'   # Solicitud inicial
-ACK = b'\x06'   # Confirmación OK
-NACK = b'\x15'  # Error / No reconocido
+# Bytes de control del protocolo con los monitores
+ENQ = b'\x05'   # el monitor lo manda al conectarse
+ACK = b'\x06'   # respuesta: OK
+NACK = b'\x15'  # respuesta: rechazado
 
-# Códigos de escape ANSI para formato visual y colores del panel
+# Códigos ANSI para dar color al panel de la terminal
 RESET = "\033[0m"
 BOLD = "\033[1m"
 
 COLOR_VERDE = "\033[32m"
-COLOR_VERDE_PARPADEO = "\033[5;32m"  # Parpadeo verde para REGANDO
-COLOR_ROJO = "\033[31m"              # Rojo para AVERIADA / FUGA
-COLOR_NARANJA = "\033[33m"           # Amarillo / Naranja para FUERA DE SERVICIO
-COLOR_GRIS = "\033[90m"              # Gris para DESCONECTADA
+COLOR_VERDE_PARPADEO = "\033[5;32m"  # verde parpadeante para REGANDO
+COLOR_ROJO = "\033[31m"              # rojo para AVERIADA
+COLOR_NARANJA = "\033[33m"           # naranja para FUERA DE SERVICIO
+COLOR_GRIS = "\033[90m"              # gris para DESCONECTADA
 
+
+# Devuelve el texto del estado con su color, para el panel de la terminal
 def colorear_estado(estado: str) -> str:
-    """Devuelve el estado formateado con su color ANSI correspondiente."""
     est = (estado or "").upper()
     if est == "DISPONIBLE":
         return f"{COLOR_VERDE}{BOLD}DISPONIBLE{RESET}"
@@ -63,14 +72,22 @@ def colorear_estado(estado: str) -> str:
     return f"{RESET}{estado}"
 
 
-# Registro de sockets activos hacia los Monitores {ws_id: client_socket}
+# ============================================================
+#  SOCKETS CON LOS MONITORES
+# ============================================================
+
+# Monitores conectados ahora mismo: {"WS-01": socket, ...}
+# Lo usan varios hilos, por eso va con lock
 lock_monitores = threading.Lock()
 monitores_conectados = {}
+
+# Estaciones que estaban bloqueadas (naranja) cuando les entró una avería.
+# Al arreglarse tienen que volver a naranja, no a verde
 bloqueadas_con_averia = set()
 
 
+# Manda una orden (ORDEN#BLOQUEAR, ORDEN#ACTIVAR) al monitor de una estación
 def notificar_monitor(ws_id: str, orden: str):
-    """Envía una orden al monitor de una estación por socket (si está conectado)."""
     with lock_monitores:
         sock = monitores_conectados.get(ws_id)
     if sock:
@@ -79,24 +96,25 @@ def notificar_monitor(ws_id: str, orden: str):
         except Exception:
             pass
 
-TIMEOUT_MONITOR = 6     # s sin recibir nada del Monitor (ni PING) -> DESCONECTADA
-TIMEOUT_HANDSHAKE = 10  # s máximos para completar ENQ + REG; si no, se cierra la conexión
+TIMEOUT_MONITOR = 6     # si en 6 s no llega nada del monitor (ni un PING), la estación pasa a DESCONECTADA
+TIMEOUT_HANDSHAKE = 10  # tiempo máximo para hacer el saludo y el registro
 
 
+# Qué hacer con cada trama que nos manda un monitor ya registrado
 def procesar_trama_monitor(ws_id, texto):
-    """Interpreta una trama recibida del Monitor ya autenticado."""
     if texto == "PING":
-        return   # latido: solo sirve para saber que el Monitor sigue vivo
+        return   # solo sirve para saber que el monitor sigue vivo
 
     if texto == "ALERT#FUGA":
         if get_estado_estacion(ws_id) == "FUERA DE SERVICIO":
-            bloqueadas_con_averia.add(ws_id)   # recordar que estaba bloqueada
+            bloqueadas_con_averia.add(ws_id)   # nos acordamos de que estaba bloqueada
         actualizar_estado_estacion(ws_id, "AVERIADA")
         print(f"\n[ALERTA CRÍTICA] ¡Avería/Fuga detectada en {ws_id}! -> Estado en BD: AVERIADA\n")
 
     elif texto == "ALERT#RESUELTA":
         estado = get_estado_estacion(ws_id)
         if estado == "AVERIADA":
+            # Si estaba bloqueada antes de la avería, vuelve a naranja; si no, a verde
             if ws_id in bloqueadas_con_averia:
                 bloqueadas_con_averia.discard(ws_id)
                 nuevo = "FUERA DE SERVICIO"
@@ -111,16 +129,21 @@ def procesar_trama_monitor(ws_id, texto):
         print(f"[CENTRAL] Trama desconocida de {ws_id}: {texto!r}")
 
 
-#cada vez que un Monitor se conecta a la central el servidor principal geenera un hilo que ejecuta la funciòn exclusiva para esa conexión
+# Atiende a un monitor. Cada monitor que se conecta tiene su propio hilo
+# ejecutando esta función. Pasos:
+#   1. Saludo: el monitor manda ENQ y le contestamos ACK
+#   2. Registro: manda REG#id#ubicacion y lo comprobamos en la BD
+#   3. Escucha: recibimos sus PING y sus avisos hasta que se desconecte
 def handle_monitor_client(client_socket, client_address):
     ws_id = None
-    print(f"\n[CENTRAL] Conexión TCP entrante desde {client_address}") #client address--> tupla de la IP y puerto
+    print(f"\n[CENTRAL] Conexión TCP entrante desde {client_address}")   # client_address = (IP, puerto)
     try:
-        # Si en TIMEOUT_HANDSHAKE s no completa el saludo y el registro, se cierra:
-        # una conexión que no dice nada no puede tener un hilo ocupado para siempre.
+        # Si en 10 s no completa el saludo y el registro, cerramos: una
+        # conexión que no dice nada no puede tener un hilo ocupado para siempre
         client_socket.settimeout(TIMEOUT_HANDSHAKE)
-        #Handshake inicial
-        data = client_socket.recv(1024)#hilo se pausa hasta que llegan bytes por la red
+
+        # --- 1. Saludo ---
+        data = client_socket.recv(1024)
         if data != ENQ:
             print(f"[CENTRAL] Byte recibido incorrecto ({data}). Enviando <NACK>...")
             client_socket.sendall(NACK)
@@ -129,9 +152,8 @@ def handle_monitor_client(client_socket, client_address):
         client_socket.sendall(ACK)
         print(f"[CENTRAL] Handshake superado con {client_address}. Esperando registro...")
 
-        # convierte los bytes entrantes en texto legible mediante 'decode'
+        # --- 2. Registro: REG#id#ubicacion ---
         reg_data = client_socket.recv(1024).decode('utf-8').strip()
-        #cada vez que nos envíemos datos separaremos cada dato con una almohadilla
         partes = reg_data.split("#")
 
         if len(partes) == 3 and partes[0] == "REG":
@@ -142,11 +164,11 @@ def handle_monitor_client(client_socket, client_address):
                 with lock_monitores:
                     duplicado = ws_id in monitores_conectados
                     if not duplicado:
-                        monitores_conectados[ws_id] = client_socket  # <--- GUARDAR AQUÍ
+                        monitores_conectados[ws_id] = client_socket
                 if duplicado:
-                    # Ya hay un Monitor vivo con este ID: no dejamos que otro lo suplante.
-                    # (Si el anterior estaba colgado, el latido lo da por muerto en
-                    # TIMEOUT_MONITOR s y el nuevo entrará en su siguiente reintento.)
+                    # Ya hay un monitor conectado con este ID: rechazamos al segundo.
+                    # Si el primero estaba colgado, a los 6 s sin PING se da por
+                    # desconectado y el nuevo podrá entrar en su siguiente intento
                     client_socket.sendall(NACK)
                     print(f"[CENTRAL] Rechazado: ya hay un Monitor conectado como {ws_id}.")
                     return
@@ -161,9 +183,9 @@ def handle_monitor_client(client_socket, client_address):
             client_socket.sendall(NACK)
             return
 
-        #Mantener la escucha de alertas mientras la estación siga viva.
-        #El Monitor manda un PING cada 2 s: si en TIMEOUT_MONITOR s no llega nada
-        #(Monitor colgado, red cortada sin cierre...), la damos por DESCONECTADA.
+        # --- 3. Escucha ---
+        # El monitor manda un PING cada 2 s. Si en 6 s no llega nada (monitor
+        # colgado, red cortada...), salta el timeout y la damos por desconectada
         client_socket.settimeout(TIMEOUT_MONITOR)
         buffer = ""
         while True:
@@ -173,10 +195,11 @@ def handle_monitor_client(client_socket, client_address):
                 print(f"\n[CENTRAL] {ws_id} no da señales de vida en {TIMEOUT_MONITOR}s. Se da por desconectada.")
                 break
             if not msg:
-                break
+                break   # el monitor ha cerrado la conexión
 
             buffer += msg.decode('utf-8', 'replace')
-            # Cada trama del Monitor termina en "\n": procesamos las completas
+            # Cada trama acaba en "\n". Puede que lleguen dos juntas o una a
+            # medias, así que vamos sacando del buffer las que estén completas
             while "\n" in buffer:
                 texto, buffer = buffer.split("\n", 1)
                 procesar_trama_monitor(ws_id, texto.strip())
@@ -184,72 +207,69 @@ def handle_monitor_client(client_socket, client_address):
     except Exception as e:
         print(f"[CENTRAL] Incidencia con {ws_id or client_address}: {e}")
     finally:
+        # Al salir (por el motivo que sea) quitamos el monitor de la lista y
+        # marcamos la estación como DESCONECTADA. Solo si este socket es el
+        # que teníamos guardado: si es una conexión rechazada, no tocamos nada
         if ws_id:
             with lock_monitores:
-                # Solo si ESTE socket sigue siendo el registrado: si la estación ya se ha
-                # vuelto a conectar por otro socket, cerrar este no debe desconectarla.
                 es_el_actual = monitores_conectados.get(ws_id) is client_socket
                 if es_el_actual:
-                    monitores_conectados.pop(ws_id, None)  # <--- ELIMINAR AQUÍ
+                    monitores_conectados.pop(ws_id, None)
             if es_el_actual:
                 actualizar_estado_estacion(ws_id, "DESCONECTADA")
                 print(f"[CENTRAL] Estación {ws_id} desconectada -> Estado: DESCONECTADA\n")
         client_socket.close()
 
 
-#actúa como recepcionista de la central, su propósito es poner en marcha el servidor de red, quedarse esperando llamadas entrantes de los monitores
-#y derivar cada conexión a un hilo independiente
+# Servidor de sockets: espera conexiones de monitores y lanza un hilo para cada una
 def start_socket_server(port):
-    #crea el objeto de socket de red
     server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    #activa la reutilización automática del puerto local.
-    #aunque hagas control + C y se vuelva a ejectuar inmediatamente
+    # Permite volver a arrancar Central enseguida sin esperar a que se libere el puerto
     server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
 
-    #enlaza el socket a una interfaz física y a un puerto. Al poner 0.0.0.0 le ordena que escuche en todas las tarjetas e interfaces de red del equipo
+    # 0.0.0.0 = escuchar en todas las interfaces de red del equipo
     server.bind(("0.0.0.0", port))
-    #pone el socket en modo de escucha pasiva
-    server.listen(50)   # cola de conexiones pendientes (con 5, en ráfagas se rechazaban)
+    server.listen(50)   # hasta 50 conexiones esperando a ser aceptadas
     print(f"[CENTRAL] Servidor de Sockets a la escucha en el puerto {port}...")
 
     while True:
         client_sock, addr = server.accept()
-        #cre un nuevo hilo de ejecución en paralelo
         thread = threading.Thread(target=handle_monitor_client, args=(client_sock, addr))
-        #hilo en segundo plano(demonio), todos los hilos creados se destruyen al instante  sin dejar procesos huérfanos
+        # daemon = el hilo se cierra solo cuando se cierra Central
         thread.daemon = True
-        #arranca el hilo
         thread.start()
 
 
+# ============================================================
+#  RIEGOS POR KAFKA
+# ============================================================
 
-# COORDINACIÓN DE RIEGO POR KAFKA
+# Topics (tienen que llamarse igual en WM_FO y WM_WS_E)
+TOPIC_SOLICITUDES = "wm_solicitudes"   # Operario/estación -> Central: SOLICITUD, LISTAR
+TOPIC_RESPUESTAS = "wm_respuestas"     # Central -> Operario: INFO, AUTORIZADO, DENEGADO, RESUMEN, LISTADO (y el LATIDO)
+TOPIC_ORDENES = "wm_ordenes"           # Central -> Engine: ABRIR, CERRAR
+TOPIC_TELEMETRIA = "wm_telemetria"     # Engine -> Central/Operario: INICIO, TELEMETRIA, FIN, RECHAZO
 
-# Topics (deben llamarse igual en WM_FO y WM_WS_E)
-TOPIC_SOLICITUDES = "wm_solicitudes"   # Operario/estación -> CENTRAL: SOLICITUD, LISTAR
-TOPIC_RESPUESTAS = "wm_respuestas"     # CENTRAL -> Operario: INFO, AUTORIZADO, DENEGADO, RESUMEN, LISTADO
-TOPIC_ORDENES = "wm_ordenes"           # CENTRAL -> Engine: ABRIR, CERRAR
-TOPIC_TELEMETRIA = "wm_telemetria"     # Engine -> CENTRAL/Operario: INICIO, TELEMETRIA, FIN, RECHAZO
-
-TIMEOUT_APERTURA = 5    # s que esperamos a que el Engine confirme la apertura (INICIO)
-TIMEOUT_SIN_NOTICIAS = 8  # s sin telemetría de un riego en curso -> se da por terminado
+TIMEOUT_APERTURA = 5      # segundos que esperamos a que el engine confirme que ha abierto (INICIO)
+TIMEOUT_SIN_NOTICIAS = 8  # segundos sin telemetría de un riego en curso -> lo damos por terminado
 
 producer = None
-lock_riegos = threading.Lock()
-#Riegos pedidos al Engine pero aún sin confirmar:  ws_id -> datos de la petición
+lock_riegos = threading.Lock()   # pendientes y activos los tocan varios hilos
+# Riegos que hemos mandado abrir pero el engine todavía no ha confirmado: {ws_id: datos}
 pendientes = {}
-#Riegos en curso:  ws_id -> {req_id, op_id, caudal, volumen, transcurrido, sol}
+# Riegos en marcha: {ws_id: {req_id, op_id, caudal, volumen, transcurrido, ultimo, sol}}
 activos = {}
 
 
+# Publica un mensaje en Kafka con la hora y espera a que salga
 def enviar(topic, mensaje, clave):
     mensaje["ts"] = time.time()
     producer.send(topic, key=clave, value=mensaje)
     producer.flush(timeout=5)
 
 
+# Manda un mensaje al operario que hizo la petición 'sol'
 def responder_operario(tipo, sol, mensaje, **extra):
-    """Manda un mensaje al operario que hizo la petición 'sol'."""
     datos = {"tipo": tipo, "op_id": sol.get("op_id"), "req_id": sol.get("req_id"),
              "ws_id": sol.get("ws_id"), "mensaje": mensaje}
     datos.update(extra)
@@ -261,19 +281,20 @@ def denegar(sol, motivo):
     responder_operario("DENEGADO", sol, motivo)
 
 
-#1. Peticiones que llegan de los operarios
+# Petición de riego de un operario (o de Central, o manual desde la estación).
+# Comprobamos operario y estación, la reservamos y le mandamos ABRIR al engine
 def procesar_solicitud(sol):
     op_id = sol.get("op_id")
     ws_id = sol.get("ws_id")
     print(f"[CENTRAL-RIEGO] Petición de {op_id}: regar {ws_id} durante {sol.get('duracion')}s")
     responder_operario("INFO", sol, f"CENTRAL ha recibido la petición. Comprobando {ws_id}...")
 
-    #El operario tiene que estar registrado
+    # El operario tiene que estar dado de alta (salvo los riegos de Central y los manuales)
     interno = op_id == "CENTRAL" or str(op_id).startswith("MANUAL-")
     if not interno and not existe_operario(op_id):
         return denegar(sol, f"El operario {op_id} no está registrado en CENTRAL")
 
-    #La estación tiene que existir, estar DISPONIBLE y no tener otro riego en marcha
+    # La estación tiene que existir, estar DISPONIBLE y no tener ya otro riego
     estado = get_estado_estacion(ws_id)
     if estado is None:
         return denegar(sol, f"La estación {ws_id} no existe")
@@ -282,7 +303,7 @@ def procesar_solicitud(sol):
             return denegar(sol, f"La estación {ws_id} ya está ocupada con otro riego")
         if estado != "DISPONIBLE":
             return denegar(sol, f"La estación {ws_id} no está disponible (estado: {estado})")
-        #La reservamos y le ordenamos abrir
+        # La reservamos para que nadie más la pueda pedir mientras abre
         pendientes[ws_id] = {"enviado": time.time(), "sol": sol}
 
     responder_operario("INFO", sol, f"{ws_id} disponible. Solicitando apertura de la electroválvula...")
@@ -291,17 +312,19 @@ def procesar_solicitud(sol):
                            "duracion": int(sol.get("duracion", 10))}, clave=ws_id)
 
 
+# El operario quiere ver todas las estaciones y su estado
 def procesar_listado(sol):
-    """El operario quiere ver las estaciones y su estado."""
     estaciones = [{"ws_id": e[0], "ubicacion": e[1], "estado": e[2]} for e in get_estaciones()]
     responder_operario("LISTADO", sol, "Estado de las estaciones", estaciones=estaciones)
 
 
-#Eventos que llegan de los Engines
+# Mensajes que llegan de los engines por wm_telemetria
 def procesar_evento_ws(ev):
     tipo = ev.get("tipo")
     ws_id = ev.get("ws_id")
 
+    # El engine ha abierto la válvula: el riego pasa de pendiente a activo
+    # y ahora sí le decimos al operario que está AUTORIZADO
     if tipo == "INICIO":
         with lock_riegos:
             pend = pendientes.get(ws_id)
@@ -316,12 +339,14 @@ def procesar_evento_ws(ev):
         responder_operario("AUTORIZADO", pend["sol"],
                            f"Riego AUTORIZADO. {ws_id} ha abierto la electroválvula.")
 
+    # El engine no ha podido abrir (avería, sin monitor...): se deniega
     elif tipo == "RECHAZO":
         with lock_riegos:
             pend = pendientes.pop(ws_id, None)
         if pend and pend["sol"].get("req_id") == ev.get("req_id"):
             denegar(pend["sol"], f"{ws_id} rechazó la apertura: {ev.get('motivo')}")
 
+    # Datos de caudal y volumen de cada segundo
     elif tipo == "TELEMETRIA":
         with lock_riegos:
             act = activos.get(ws_id)
@@ -333,38 +358,39 @@ def procesar_evento_ws(ev):
         print(f"[CENTRAL-RIEGO] {ws_id} | {ev.get('caudal'):5.2f} l/min | "
               f"{ev.get('volumen'):7.2f} l | operario {ev.get('op_id')}")
 
+    # Fin del riego: ponemos la estación en el estado que toque y mandamos el resumen
     elif tipo == "FIN":
         with lock_riegos:
             act = activos.get(ws_id)
             if act and act["req_id"] != ev.get("req_id"):
-                return   # FIN atrasado de un riego anterior
+                return   # es el FIN atrasado de un riego anterior
             activos.pop(ws_id, None)
             pendientes.pop(ws_id, None)
 
         motivo = ev.get("motivo")
         estado_actual = get_estado_estacion(ws_id)
 
-        # Solo cambiamos el estado si es un riego que CENTRAL tenía en curso. Un FIN de
-        # un riego que no conocemos (p.ej. terminó con CENTRAL caída) solo genera el
-        # resumen para el operario: el estado real de la estación ya lo da su Monitor.
+        # Si es un riego que no teníamos apuntado (por ejemplo, terminó mientras
+        # Central estaba caída) no tocamos el estado, eso ya lo dice el monitor.
+        # Solo mandamos el resumen al operario
         if not act:
             pass
 
-        # 1. Si el motivo fue una fuga detectada durante el riego
+        # Ha terminado por una fuga
         elif motivo == "FUGA":
             actualizar_estado_estacion(ws_id, "AVERIADA")
 
-        # 2. Si el motivo fue el bloqueo del Administrador o ya estaba marcada como FUERA DE SERVICIO
+        # Ha terminado porque la hemos bloqueado, o ya estaba en FUERA DE SERVICIO
         elif motivo == "BLOQUEO_ADMIN_CENTRAL" or estado_actual in ("FUERA DE SERVICIO", "BLOQUEADA"):
             actualizar_estado_estacion(ws_id, "FUERA DE SERVICIO")
 
+        # Ha terminado porque se ha caído el monitor
         elif motivo=="MONITOR_CAIDO":
-                    actualizar_estado_estacion(ws_id, "DESCONECTADA") 
+            actualizar_estado_estacion(ws_id, "DESCONECTADA")
 
-        # 3. Solo si fue un fin normal (por tiempo límite o parada voluntaria) vuelve a DISPONIBLE
+        # Fin normal (tiempo límite o parada manual): vuelve a DISPONIBLE
         elif estado_actual == "REGANDO":
             actualizar_estado_estacion(ws_id, "DISPONIBLE")
-          
 
         print(f"[CENTRAL-RIEGO] {ws_id} FIN de riego ({motivo}): "
               f"{ev.get('duracion')}s, {ev.get('litros')} l")
@@ -374,11 +400,12 @@ def procesar_evento_ws(ev):
                            motivo=motivo, duracion=ev.get("duracion"), litros=ev.get("litros"))
 
 
+# Hilo que cada segundo revisa dos cosas:
+#  - riegos que mandamos abrir y el engine no ha confirmado en 5 s -> se deniegan
+#  - riegos en marcha de los que no sabemos nada en 8 s (engine caído o FIN
+#    perdido) -> se dan por terminados, para que la estación no se quede
+#    ocupada para siempre
 def vigilar_timeouts():
-    """Vigila dos cosas cada segundo:
-    - Si un Engine no confirma la apertura en TIMEOUT_APERTURA s -> se deniega y se libera.
-    - Si de un riego en curso no llega nada en TIMEOUT_SIN_NOTICIAS s (Engine caído o FIN
-      perdido) -> se da por terminado. Si no, la estación quedaría "ocupada" para siempre."""
     while True:
         time.sleep(1)
         try:
@@ -402,40 +429,38 @@ def vigilar_timeouts():
                                    motivo="SIN_NOTICIAS_ESTACION",
                                    duracion=a["transcurrido"], litros=a["volumen"])
         except Exception as e:
-            # Si Kafka está caído, enviar() lanza excepción: sin este try el hilo
-            # moriría y Central dejaría de vigilar los timeouts para siempre.
+            # Si Kafka está caído, enviar() da error. Con el try el hilo sigue
+            # vivo y lo vuelve a intentar en la siguiente vuelta
             print(f"[CENTRAL-RIEGO] Error vigilando timeouts (se reintenta): {e}")
 
 
+# Al arrancar Central nos saltamos las peticiones que se quedaron en Kafka
+# mientras estaba apagada (los operarios ya las habrán dado por perdidas).
+# No miramos la hora de los mensajes porque la pone el ordenador que los
+# envía, y en el laboratorio había PCs con el reloj desfasado una hora.
+# La telemetría NO se salta: si un riego terminó con Central caída, su FIN
+# está ahí y hay que procesarlo para mandarle el resumen al operario
 def saltar_mensajes_antiguos(consumer):
-    """Al arrancar, CENTRAL ignora lo que se quedó en Kafka mientras estaba caída
-    (peticiones viejas que los operarios ya habrán dado por perdidas).
-    Antes se hacía comparando el campo 'ts' del mensaje con la hora de CENTRAL,
-    pero 'ts' lo pone el reloj del ordenador que envía: si ese reloj va desfasado
-    (p.ej. un PC del laboratorio con 1 hora de retraso), CENTRAL descartaba TODAS
-    sus peticiones. Saltando al final de los topics no dependemos de ningún reloj."""
-    # OJO: solo se saltan las PETICIONES. La telemetría (INICIO/FIN de riegos) se
-    # sigue leyendo desde donde se quedó: si un riego terminó con CENTRAL caída, su
-    # FIN está ahí y hay que procesarlo para mandar el resumen al operario
-    # (la guía exige que no se pierda ninguna transacción).
     telemetria_previa = []
     limite = time.time() + 30
+    # Esperamos a que Kafka nos asigne los topics
     while not consumer.assignment() and time.time() < limite:
         lotes = consumer.poll(timeout_ms=200)
         for registros in lotes.values():
             telemetria_previa += [r for r in registros if r.topic == TOPIC_TELEMETRIA]
+    # Solo el topic de peticiones lo movemos al final
     solicitudes = [tp for tp in consumer.assignment() if tp.topic == TOPIC_SOLICITUDES]
     if solicitudes:
         consumer.seek_to_end(*solicitudes)
         for tp in solicitudes:
-            consumer.position(tp)           # fija ya la posición "final"
+            consumer.position(tp)
     return telemetria_previa
 
 
-#Bucle consumidor
+# Hilo que lee de Kafka. Usamos un solo consumidor para peticiones y
+# telemetría: así todo se procesa en orden y en un único hilo, y dos
+# peticiones a la misma estación nunca se cruzan
 def bucle_kafka(broker):
-    # Un único consumidor para peticiones y telemetría: todas las decisiones se toman
-    # en un solo hilo y en orden, así dos peticiones a la misma estación no se cruzan.
     consumer = KafkaConsumer(
         bootstrap_servers=[broker],
         group_id="wm_central",
@@ -453,7 +478,7 @@ def bucle_kafka(broker):
     while True:
         try:
             lotes = consumer.poll(timeout_ms=500)
-        except Exception as e:   # el broker se ha caído o no responde: reintentar
+        except Exception as e:   # si Kafka se cae, esperamos y volvemos a intentar
             print(f"[CENTRAL-RIEGO] Error leyendo de Kafka (se reintenta): {e}")
             time.sleep(2)
             continue
@@ -468,12 +493,12 @@ def bucle_kafka(broker):
                             procesar_listado(m)
                     else:
                         procesar_evento_ws(m)
-                except Exception as e:   # un mensaje malformado no debe tumbar CENTRAL
+                except Exception as e:   # un mensaje mal formado no puede tirar Central
                     print(f"[CENTRAL-RIEGO] Error procesando {m}: {e}")
 
 
+# Crea los topics si no existen. Si falla no pasa nada: Kafka los crea solo
 def crear_topics(broker):
-    """Crea los topics si no existen (si falla no pasa nada: Kafka los crea solo)."""
     try:
         from kafka.admin import KafkaAdminClient, NewTopic
         admin = KafkaAdminClient(bootstrap_servers=[broker])
@@ -487,6 +512,9 @@ def crear_topics(broker):
     except Exception as e:
         print(f"[CENTRAL-RIEGO] Aviso: no se pudieron crear los topics ({e})")
 
+
+# Hilo que publica un LATIDO cada 2 s. Los operarios y los engines lo usan
+# para saber si Central sigue viva
 def latido():
     while True:
         try:
@@ -495,6 +523,8 @@ def latido():
             pass
         time.sleep(2)
 
+
+# Conecta con Kafka y arranca los tres hilos de los riegos
 def iniciar_kafka(broker):
     global producer
     try:
@@ -503,7 +533,7 @@ def iniciar_kafka(broker):
             key_serializer=lambda k: k.encode("utf-8") if k else None,
             value_serializer=lambda v: json.dumps(v).encode("utf-8"),
             acks="all",
-           retries=5,
+            retries=5,
         )
     except NoBrokersAvailable:
         print(f"[CENTRAL-RIEGO] AVISO: no hay Kafka en {broker}. Central funcionará solo con sockets.")
@@ -513,12 +543,16 @@ def iniciar_kafka(broker):
     threading.Thread(target=vigilar_timeouts, daemon=True).start()
     threading.Thread(target=latido, daemon=True).start()
 
-# =========================================================================
-# FUNCIONES DE ADMINISTRACIÓN CENTRAL (Punto 11)
-# =========================================================================
 
+# ============================================================
+#  ÓRDENES DE ADMINISTRACIÓN (punto 11 del enunciado)
+#  Se usan igual desde la consola y desde el panel web.
+#  ws_id puede ser una estación o "ALL" para todas
+# ============================================================
+
+# Iniciar un riego desde Central: se manda una SOLICITUD como si fuéramos un
+# operario (con op_id "CENTRAL"), así pasa por las mismas comprobaciones
 def admin_forzar_riego(ws_id: str, duracion: int = 20, publicar_mensaje=None):
-    """Opción 'Iniciar un riego' de CENTRAL (Punto 11): se comporta igual que un operario."""
     estaciones = get_estaciones()
     destinos = [e[0] for e in estaciones] if ws_id.lower() == "all" else [ws_id]
 
@@ -538,7 +572,7 @@ def admin_forzar_riego(ws_id: str, duracion: int = 20, publicar_mensaje=None):
         sol = {
             "tipo": "SOLICITUD",
             "req_id": f"CEN-{uuid.uuid4().hex[:8]}",
-            "op_id": "CENTRAL",   # <--- Reconocido como interno por procesar_solicitud
+            "op_id": "CENTRAL",
             "ws_id": target,
             "duracion": duracion
         }
@@ -550,6 +584,11 @@ def admin_forzar_riego(ws_id: str, duracion: int = 20, publicar_mensaje=None):
             print(mensaje)
 
 
+# Bloquear: pasa a FUERA DE SERVICIO (naranja) y corta el riego si lo hay.
+#  - DISPONIBLE o REGANDO -> se bloquea
+#  - AVERIADA -> sigue en rojo, pero cuando se arregle quedará en naranja
+#  - DESCONECTADA o no existe -> no se toca
+# Devuelve un texto con lo que ha pasado para enseñarlo en pantalla
 def admin_bloquear_estacion(ws_id: str):
     estaciones = get_estaciones()
     destinos = [e[0] for e in estaciones] if ws_id.lower() == "all" else [ws_id]
@@ -568,7 +607,7 @@ def admin_bloquear_estacion(ws_id: str):
             bloqueadas.append(target)
 
         elif estado == "AVERIADA":
-            bloqueadas_con_averia.add(target)   # al resolverse la fuga quedará en NARANJA
+            bloqueadas_con_averia.add(target)
             notificar_monitor(target, "ORDEN#BLOQUEAR")
             en_averia.append(target)
 
@@ -585,6 +624,8 @@ def admin_bloquear_estacion(ws_id: str):
     return "[ADMIN] " + " ".join(resultado)
 
 
+# Activar: solo para las que están en FUERA DE SERVICIO, que vuelven a DISPONIBLE.
+# Las demás (averiadas, desconectadas...) no se tocan
 def admin_activar_estacion(ws_id: str):
     estaciones = get_estaciones()
     destinos = [e[0] for e in estaciones] if ws_id.lower() == "all" else [ws_id]
@@ -607,36 +648,25 @@ def admin_activar_estacion(ws_id: str):
     if rechazadas:
         resultado.append(f"No se activan (no están FUERA DE SERVICIO): {', '.join(rechazadas)}.")
     return "[ADMIN] " + " ".join(resultado)
-    """Opción 'Activar la WS' (Punto 11): vuelve a estado ACTIVADA/DISPONIBLE (verde)."""
-    estaciones = get_estaciones()
-    destinos = [e[0] for e in estaciones] if ws_id.lower() == "all" else [ws_id]
-
-    for target in destinos:
-        bloqueadas_con_averia.discard(target)
-        # Volvemos a DISPONIBLE en BD
-        actualizar_estado_estacion(target, "DISPONIBLE")
-
-        # Notificamos al monitor por socket
-        notificar_monitor(target, "ORDEN#ACTIVAR")
-        print(f"[ADMIN] Estación {target} ACTIVADA -> Estado: DISPONIBLE")
 
 
+# Le dice al engine que cierre la válvula (por ejemplo, al bloquear la estación)
 def ordenar_cierre(ws_id, motivo="ORDEN_CENTRAL"):
-    """Corta el riego en curso de una estación (p.ej. al bloquearla)."""
     enviar(TOPIC_ORDENES, {"tipo": "CERRAR", "ws_id": ws_id, "motivo": motivo}, clave=ws_id)
 
 
+# Datos de los riegos en marcha para pintarlos en los paneles
 def obtener_telemetria():
-    """Riegos en curso {ws_id: {caudal, volumen, op_id, ...}} para pintarlos en el panel."""
     with lock_riegos:
         return {ws: {k: v for k, v in d.items() if k not in ("sol", "ultimo")}
                 for ws, d in activos.items()}
 
 
-# =========================================================================
-# PANEL DE CONTROL Y CONSOLA DE ADMINISTRACIÓN
-# =========================================================================
+# ============================================================
+#  PANEL DE LA TERMINAL Y CONSOLA DE ADMINISTRACIÓN
+# ============================================================
 
+# Construye el texto del panel. Se vuelve a pintar cada segundo
 def construir_panel():
     estaciones_bd = get_estaciones()
     telemetria_viva = obtener_telemetria()
@@ -655,6 +685,7 @@ def construir_panel():
         for est in estaciones_bd:
             ws_id, ubicacion, estado = est[0], est[1], est[2]
 
+            # El caudal, el volumen y el operario solo se enseñan mientras riega
             tele = telemetria_viva.get(ws_id, {})
             caudal = tele.get("caudal", 0.0) if estado == "REGANDO" else 0.0
             volumen = tele.get("volumen", 0.0) if estado == "REGANDO" else 0.0
@@ -671,12 +702,14 @@ def construir_panel():
     return "\n".join(lineas)
 
 
+# Formato válido de un ID: letras mayúsculas, números, guion y guion bajo (máx. 20)
 ID_VALIDO = re.compile(r"^[A-Z0-9_-]{1,20}$")
 
 
+# Alta de una estación. La ubicación tiene que ser exactamente la misma que
+# luego se le pase al monitor, si no Central lo rechazará. No puede llevar
+# '#' porque es el separador de la trama REG#id#ubicacion
 def admin_alta_estacion(ws_id: str, ubicacion: str) -> str:
-    """Da de alta (o actualiza) una estación para que su Monitor pueda autenticarse.
-    La ubicación tiene que coincidir EXACTAMENTE con la que se pase al Monitor."""
     ws_id = ws_id.strip().upper()
     ubicacion = ubicacion.strip().strip('"').strip("'").strip()
     if not ID_VALIDO.match(ws_id) or ws_id == "ALL":
@@ -687,8 +720,9 @@ def admin_alta_estacion(ws_id: str, ubicacion: str) -> str:
     return f"[ADMIN] Estación {ws_id} ({ubicacion}) {resultado}. Arranca su Monitor con esa misma ubicación."
 
 
+# Alta de un operario. CENTRAL y MANUAL-... no se permiten porque son los
+# op_id que usamos para los riegos de Central y los manuales de la estación
 def admin_alta_operario(op_id: str, nombre: str) -> str:
-    """Da de alta (o actualiza) un operario para que Central acepte sus peticiones."""
     op_id = op_id.strip().upper()
     nombre = nombre.strip().strip('"').strip("'").strip()
     if not ID_VALIDO.match(op_id) or op_id == "CENTRAL" or op_id.startswith("MANUAL-"):
@@ -699,6 +733,8 @@ def admin_alta_operario(op_id: str, nombre: str) -> str:
     return f"[ADMIN] Operario {op_id} ({nombre}) {resultado}."
 
 
+# Interpreta un comando escrito en la consola (o enviado desde la web) y
+# llama a la función que toque. El resultado se pasa a publicar_mensaje
 def ejecutar_comando_admin(command: str, publicar_mensaje):
     try:
         partes = command.split()
@@ -716,6 +752,7 @@ def ejecutar_comando_admin(command: str, publicar_mensaje):
         elif accion == "activar" and len(partes) == 2:
             publicar_mensaje(admin_activar_estacion(partes[1].upper()))
         elif accion == "alta-ws" and len(partes) >= 3:
+            # La ubicación puede tener espacios ("Parque Norte"), por eso juntamos el resto
             publicar_mensaje(admin_alta_estacion(partes[1], " ".join(partes[2:])))
         elif accion == "alta-fo" and len(partes) >= 3:
             publicar_mensaje(admin_alta_operario(partes[1], " ".join(partes[2:])))
@@ -729,14 +766,17 @@ def ejecutar_comando_admin(command: str, publicar_mensaje):
         publicar_mensaje(f"[ADMIN ERROR] {exc}")
 
 
+# Panel de la terminal (solo cuando Central se lanza en una terminal, en local).
+# Está hecho con prompt_toolkit: arriba el panel, que se repinta cada segundo,
+# una línea con la respuesta al último comando y abajo donde se escribe
 def ejecutar_consola_admin():
-    # La consola debe dibujar directamente en la terminal real (no a través del
-    # registro de mensajes del panel web, o los dibujos acabarían en la web)
+    # El panel tiene que dibujarse directamente en la terminal. Si no, todo
+    # lo que dibuja acabaría también en los mensajes del panel web
     terminal_real = sys.stdout.destino if isinstance(sys.stdout, SalidaConRegistro) else sys.stdout
     sys.stdout = terminal_real
     entrada = TextArea(height=1, prompt="> ", multiline=False)
     atajos = KeyBindings()
-    mensaje_admin = [" "]
+    mensaje_admin = [" "]           # respuesta al último comando
     lock_mensaje = threading.Lock()
     app_ref = [None]
 
@@ -744,7 +784,7 @@ def ejecutar_consola_admin():
         with lock_mensaje:
             mensaje_admin[0] = mensaje
         if app_ref[0] is not None:
-            app_ref[0].invalidate()
+            app_ref[0].invalidate()   # repintar ya, sin esperar al siguiente segundo
 
     def leer_mensaje():
         with lock_mensaje:
@@ -754,6 +794,7 @@ def ejecutar_consola_admin():
     def salir(event):
         event.app.exit()
 
+    # Al pulsar Enter, el comando se ejecuta en otro hilo para que el panel no se congele
     @atajos.add("enter")
     def enviar_comando(_event):
         command = entrada.text.strip()
@@ -786,37 +827,34 @@ def ejecutar_consola_admin():
 
     try:
         with patch_stdout():
-            # patch_stdout cambia sys.stdout: lo envolvemos para que el panel web siga
-            # recibiendo los mensajes mientras la consola está abierta
+            # patch_stdout cambia sys.stdout. Lo envolvemos otra vez para que los
+            # mensajes sigan llegando al panel web mientras la consola está abierta
             sys.stdout = SalidaConRegistro(sys.stdout)
             app.run()
     finally:
         sys.stdout = SalidaConRegistro(terminal_real)
 
 
-# =========================================================================
-# PANEL WEB (para controlar CENTRAL cuando corre en Railway sin terminal)
-# =========================================================================
-# CENTRAL sirve una página web con el estado de las estaciones en tiempo real y
-# botones para regar, bloquear y activar. La página pregunta el estado cada
-# segundo a /api/estado y manda las órdenes a /api/comando, que reutiliza
-# exactamente las mismas funciones que la consola (ejecutar_comando_admin).
-#
-# Seguridad: si existe la variable de entorno WM_PANEL_PASSWORD, el navegador
-# pedirá usuario y contraseña (cualquier usuario + esa contraseña).
+# ============================================================
+#  PANEL WEB
+#  En Railway no hay terminal, así que Central también sirve una página web.
+#  La página pide el estado cada segundo a /api/estado y manda los botones
+#  a /api/comando, que usa las mismas funciones que la consola.
+#  Si existe la variable WM_PANEL_PASSWORD, la página pide contraseña.
+# ============================================================
 
-# Últimos mensajes de la aplicación, para mostrarlos en el panel web
+# Últimos mensajes de la aplicación, para enseñarlos en la web
 lock_log = threading.Lock()
-log_mensajes = collections.deque(maxlen=60)
+log_mensajes = collections.deque(maxlen=60)   # deque con maxlen: al llegar a 60 se van borrando los más viejos
 
 
+# Sustituye a sys.stdout. Cada print de cualquier hilo se sigue escribiendo
+# donde iba (terminal o logs de Railway) y además se guarda en log_mensajes
+# para que la web lo pueda enseñar
 class SalidaConRegistro:
-    """Sustituye a sys.stdout: cada línea que imprime cualquier hilo se sigue
-    escribiendo donde iba (terminal / logs de Railway) y además se guarda en
-    log_mensajes para que el panel web la muestre."""
     def __init__(self, destino):
         self.destino = destino
-        self.pendiente = ""
+        self.pendiente = ""   # trozo de línea que todavía no ha terminado en "\n"
 
     def write(self, texto):
         try:
@@ -827,7 +865,7 @@ class SalidaConRegistro:
         while "\n" in self.pendiente:
             linea, self.pendiente = self.pendiente.split("\n", 1)
             linea = linea.strip()
-            if linea and not linea.startswith(("=====", "-----")):
+            if linea and not linea.startswith(("=====", "-----")):   # las líneas de adorno no
                 with lock_log:
                     log_mensajes.append(f"[{time.strftime('%H:%M:%S')}] {linea}")
         return len(texto)
@@ -844,12 +882,13 @@ class SalidaConRegistro:
         except Exception:
             return False
 
-    def __getattr__(self, nombre):          # encoding, fileno... los da el destino real
+    # Cualquier otra cosa que se le pida (encoding, fileno...) la da el stdout real
+    def __getattr__(self, nombre):
         return getattr(self.destino, nombre)
 
 
+# Lo que devuelve /api/estado: estaciones con su telemetría y los últimos mensajes
 def estado_para_web():
-    """Todo lo que necesita la página: estaciones con su telemetría y mensajes."""
     telemetria = obtener_telemetria()
     estaciones = []
     for ws_id, ubicacion, estado in get_estaciones():
@@ -867,8 +906,9 @@ def estado_para_web():
             "estaciones": estaciones, "mensajes": mensajes}
 
 
+# Convierte el botón que se ha pulsado en la web en un comando de la consola
+# y devuelve la respuesta para enseñarla en la página
 def ejecutar_comando_web(datos):
-    """Traduce el botón pulsado a un comando de la consola y devuelve sus mensajes."""
     accion = str(datos.get("accion", "")).lower()
     if accion == "alta-ws":
         respuesta = admin_alta_estacion(str(datos.get("id", "")), str(datos.get("texto", "")))
@@ -899,6 +939,8 @@ def ejecutar_comando_web(datos):
     return respuestas or [f"[ADMIN] Comando '{comando}' ejecutado."]
 
 
+# Página del panel web (HTML, CSS y JavaScript). Es un texto que el servidor
+# le manda al navegador tal cual
 PAGINA_PANEL = r"""<!doctype html>
 <html lang="es">
 <head>
@@ -1122,10 +1164,16 @@ setInterval(refrescar, 1000);
 """
 
 
+# Atiende las peticiones del navegador:
+#   GET  /             -> la página
+#   GET  /api/estado   -> el estado en JSON
+#   POST /api/comando  -> ejecutar un botón
 class ManejadorPanelWeb(http.server.BaseHTTPRequestHandler):
     def log_message(self, formato, *args):
         pass   # sin esto, cada petición (una por segundo) llenaría los logs
 
+    # Si hay contraseña, el navegador la manda en la cabecera Authorization
+    # (codificada en base64). Si no coincide, devolvemos 401 y el navegador la pide
     def _autorizado(self):
         clave = os.environ.get("WM_PANEL_PASSWORD")
         if not clave:
@@ -1172,7 +1220,7 @@ class ManejadorPanelWeb(http.server.BaseHTTPRequestHandler):
             self._responder(404, "text/plain; charset=utf-8", "No encontrado")
             return
         try:
-            longitud = min(int(self.headers.get("Content-Length", 0)), 10_000)
+            longitud = min(int(self.headers.get("Content-Length", 0)), 10_000)   # como mucho leemos 10 KB
             datos = json.loads(self.rfile.read(longitud) or b"{}")
             mensajes = ejecutar_comando_web(datos)
             self._responder(200, "application/json", json.dumps({"mensajes": mensajes}))
@@ -1180,6 +1228,7 @@ class ManejadorPanelWeb(http.server.BaseHTTPRequestHandler):
             self._responder(400, "application/json", json.dumps({"mensajes": [f"[ADMIN ERROR] {e}"]}))
 
 
+# Servidor web. ThreadingHTTPServer atiende cada petición en un hilo distinto
 def iniciar_panel_web(puerto):
     servidor = http.server.ThreadingHTTPServer(("0.0.0.0", puerto), ManejadorPanelWeb)
     servidor.daemon_threads = True
@@ -1188,6 +1237,9 @@ def iniciar_panel_web(puerto):
     servidor.serve_forever()
 
 
+# ============================================================
+#  PROGRAMA PRINCIPAL
+# ============================================================
 if __name__ == "__main__":
     if len(sys.argv) < 3:
         print("Uso: python3 WM_Central.py <puerto_sockets> <ip_kafka:puerto> [puerto_web]")
@@ -1196,32 +1248,34 @@ if __name__ == "__main__":
 
     socket_port = int(sys.argv[1])
     kafka_server = sys.argv[2]
-    # Puerto del panel web: 3er argumento, o variable WM_WEB_PORT, o 8080 por defecto
+    # Puerto web: el tercer argumento, o la variable WM_WEB_PORT, o 8080
     web_port = int(sys.argv[3]) if len(sys.argv) > 3 else int(os.environ.get("WM_WEB_PORT", 8080))
 
-    # Todo lo que se imprima a partir de aquí también llega al panel web
+    # A partir de aquí todo lo que se imprima llega también al panel web
     sys.stdout = SalidaConRegistro(sys.stdout)
 
     print("=" * 50)
     print("      INICIANDO SISTEMA WM_CENTRAL")
     print("=" * 50)
 
+    # Base de datos: todas las estaciones empiezan DESCONECTADAS
     init_db()
     print("\n--- Estado inicial de estaciones (BD) ---")
     for est in get_estaciones():
         print(f"[{est[2]}] ID: {est[0]} | Zona: {est[1]}")
     print("-" * 40)
 
+    # Kafka y sus hilos (riegos, timeouts y latido)
     iniciar_kafka(kafka_server)
 
-    # 1. Servidor de sockets (hilo daemon)
+    # Servidor de sockets para los monitores
     threading.Thread(target=start_socket_server, args=(socket_port,), daemon=True).start()
 
-    # 2. Panel web (hilo daemon): estado en tiempo real + botones regar/bloquear/activar
+    # Panel web
     threading.Thread(target=iniciar_panel_web, args=(web_port,), daemon=True).start()
 
-    # En Mac con terminal abre el panel; en Railway (Docker) mantiene el servidor sin TTY
-    # Modo servidor cloud automático si no hay TTY o si prompt_toolkit falla al registrar el teclado
+    # Si hay terminal (en local) abrimos el panel de consola. En Railway no hay
+    # terminal: entonces Central se queda funcionando solo como servidor
     try:
         if sys.stdin and sys.stdin.isatty():
             ejecutar_consola_admin()

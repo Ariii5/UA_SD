@@ -1,15 +1,18 @@
-# WM_WS_E.py - Engine de la estación de riego
-# Misión:
-# - Responder OK/KO a los chequeos periódicos de salud (HEALTH?) del Monitor
-# - Simular una avería (tecla k)
-# - Simular la electroválvula y el caudalímetro
-# - Publicar en Kafka el inicio, la telemetría (cada segundo) y el fin del riego
-# - Cerrar el riego al cerrar la ventana / detener el proceso
-# - Obedecer las órdenes ABRIR / CERRAR que le manda CENTRAL por Kafka
-# - Riego manual desde la propia estación (tecla a), que también pasa por CENTRAL
+# ============================================================
+#  WM_WS_E.py - Engine de la estación de riego
 #
-# Uso: py WM_WS_E.py <ip_broker:puerto> <ip_monitor> <puerto_monitor>
-# Ej.: py WM_WS_E.py localhost:9092 127.0.0.1 5001
+#  Simula la electroválvula y el caudalímetro de la estación:
+#   - Contesta OK o KO a los HEALTH? del monitor (por socket)
+#   - Cuando Central le manda ABRIR (por Kafka) abre la válvula y cada
+#     segundo publica el caudal y los litros que lleva
+#   - Cierra cuando se acaba el tiempo, cuando Central manda CERRAR,
+#     al pulsar una tecla o si se cierra el programa
+#
+#  Teclas: k = avería | o = reparar | a <seg> = riego manual | p = parar
+#
+#  Uso: py WM_WS_E.py <ip_broker:puerto> <ip_monitor> <puerto_monitor>
+#  Ej.: py WM_WS_E.py localhost:9092 127.0.0.1 5001
+# ============================================================
 import sys
 import socket
 import threading
@@ -21,26 +24,29 @@ import os
 from kafka import KafkaProducer, KafkaConsumer
 from kafka.errors import NoBrokersAvailable
 import logging
-logging.getLogger("kafka").addHandler(logging.NullHandler())
+logging.getLogger("kafka").addHandler(logging.NullHandler())   # para que kafka-python no llene la pantalla de avisos
 
-simular_fuga = False
-monitor_conectado = False
+simular_fuga = False        # True al pulsar k: contestamos KO al monitor
+monitor_conectado = False   # sin monitor la estación está averiada y no riega
 
-#Kafka
+# Topics de Kafka
 TOPIC_TELEMETRIA = "wm_telemetria"   # Engine -> Central y operarios
-TOPIC_ORDENES = "wm_ordenes"         # Central -> Engine
+TOPIC_ORDENES = "wm_ordenes"         # Central -> Engine (ABRIR, CERRAR)
 TOPIC_SOLICITUDES = "wm_solicitudes" # Engine -> Central (riego manual desde la estación)
-TOPIC_RESPUESTAS = "wm_respuestas"   # Central -> quien pidió el riego
-MAX_ANTIGUEDAD_ORDEN = 4             # s: órdenes más viejas se ignoran
-desfase_central = 0.0                # s que nuestro reloj va por delante del de CENTRAL (se mide con su LATIDO)
-producer = None   # se crea en el main, cuando ya sabemos el ws_id
-ws_id = None      # nos lo envía el Monitor al conectarnos
-ultimo_latido = time.time()
+TOPIC_RESPUESTAS = "wm_respuestas"   # Central -> quien pidió el riego (y el LATIDO)
+
+MAX_ANTIGUEDAD_ORDEN = 4    # las órdenes con más de 4 s se ignoran
+desfase_central = 0.0       # segundos que nuestro reloj va por delante del de Central (se calcula con su LATIDO)
+producer = None             # productor de Kafka, se crea en el main
+ws_id = None                # nuestro ID, nos lo dice el monitor al conectarnos
+ultimo_latido = time.time() # última vez que recibimos el LATIDO de Central
+
+# Carpeta donde guardamos lo que llevamos regado, por si el programa muere a mitad
 DIR_DATOS = os.path.join(os.path.dirname(os.path.abspath(__file__)), "datos")
 
 
+# Publica un mensaje en Kafka añadiéndole nuestro ID y la hora
 def publicar(topic, mensaje):
-    """Envía un diccionario a Kafka (como JSON) añadiendo el id de la estación y la hora."""
     mensaje["ws_id"] = ws_id
     mensaje["ts"] = time.time()
     try:
@@ -49,10 +55,19 @@ def publicar(topic, mensaje):
         print(f"[ENGINE] Error publicando en Kafka: {e}")
 
 
+# ------------------------------------------------------------
+#  Fichero del riego en curso (para no perder lo regado)
+# ------------------------------------------------------------
+# Mientras riega, cada segundo guardamos en datos/riego_WS-XX.json lo que
+# llevamos. Si el programa muere de golpe, al volver a arrancar lo leemos y
+# mandamos a Central el final de ese riego
+
 def fichero_estado():
     return os.path.join(DIR_DATOS, f"riego_{ws_id}.json")
 
 
+# Primero se escribe en un .tmp y luego se renombra: así nunca queda un
+# fichero a medias si el programa se corta justo mientras escribe
 def guardar_estado(datos):
     os.makedirs(DIR_DATOS, exist_ok=True)
     tmp = fichero_estado() + ".tmp"
@@ -68,6 +83,7 @@ def borrar_estado():
         pass
 
 
+# Al arrancar: si hay un riego a medias guardado, mandamos su FIN a Central
 def recuperar_riego():
     try:
         with open(fichero_estado()) as f:
@@ -85,23 +101,27 @@ def recuperar_riego():
         print("[ENGINE] No se pudo enviar el estado final; se reintentará en el próximo arranque.")
 
 
-#electroválvula y caudalímetro
-CAUDAL_NOMINAL = 12.0   # litros/minuto con la válvula abierta
+# ------------------------------------------------------------
+#  Electroválvula y caudalímetro
+# ------------------------------------------------------------
+CAUDAL_NOMINAL = 12.0   # litros por minuto con la válvula abierta
 
-lock = threading.Lock()  # protege 'riego', que lo tocan varios hilos
+# 'riego' lo tocan varios hilos (órdenes de Kafka, teclado, caudalímetro),
+# así que siempre se usa con el lock
+lock = threading.Lock()
 riego = {
     "valvula_abierta": False,
-    "inicio": 0.0,        # momento en que se abrió (segundos)
-    "duracion_max": 0,    # tiempo límite del riego (segundos)
+    "inicio": 0.0,        # momento en que se abrió
+    "duracion_max": 0,    # segundos que tiene que durar
     "caudal": 0.0,        # litros/minuto ahora mismo
-    "volumen": 0.0,       # litros acumulados desde que se abrió
+    "volumen": 0.0,       # litros acumulados
     "op_id": None,        # operario que pidió el riego
-    "req_id": None,       # id de la petición, para que Central sepa a qué riego se refiere
+    "req_id": None,       # id de la petición, para que Central sepa de qué riego hablamos
 }
 
 
+# Abre la válvula si se puede. Devuelve (True, "") o (False, motivo del rechazo)
 def abrir_valvula(duracion, op_id=None, req_id=None):
-    """Abre la válvula si se puede. Devuelve (True, "") o (False, motivo del rechazo)."""
     with lock:
         if not monitor_conectado:
             return False, "La estación está averiada (sin monitor)"
@@ -117,12 +137,14 @@ def abrir_valvula(duracion, op_id=None, req_id=None):
         riego["op_id"] = op_id
         riego["req_id"] = req_id
     print(f"\n[ENGINE] >>> ELECTROVÁLVULA ABIERTA (operario {op_id}, límite {duracion}s)")
+    # Avisamos a Central de que hemos abierto (con esto autoriza al operario)
     publicar(TOPIC_TELEMETRIA, {"tipo": "INICIO", "duracion_max": duracion,
                                 "op_id": op_id, "req_id": req_id})
     threading.Thread(target=bucle_caudalimetro, daemon=True).start()
     return True, ""
 
 
+# Cierra la válvula y publica el FIN con el motivo, la duración y los litros
 def cerrar_valvula(motivo):
     with lock:
         if not riego["valvula_abierta"]:
@@ -140,20 +162,22 @@ def cerrar_valvula(motivo):
                                 "op_id": op_id, "req_id": req_id})
     borrar_estado()
     try:
-        producer.flush(timeout=3)   # obliga a enviar ya lo pendiente: el FIN no se puede perder
+        producer.flush(timeout=3)   # forzamos que el FIN salga ya, no se puede perder
     except Exception:
-        # Kafka va lento: el FIN sigue en la cola del productor y se enviará en cuanto se pueda.
-        # NO dejamos que el error rompa el hilo
+        # Si Kafka va lento el FIN se queda en la cola y se envía en cuanto
+        # se pueda. No dejamos que el error pare el programa
         print("[ENGINE] Aviso: Kafka tarda en confirmar el FIN; se reintentará automáticamente.")
 
 
+# Hilo que funciona mientras la válvula está abierta: cada segundo mide el
+# caudal, suma los litros, lo guarda en el fichero y lo publica
 def bucle_caudalimetro():
-    """Hilo que vive mientras la válvula está abierta: cada segundo mide y publica."""
     while True:
         time.sleep(1)
         with lock:
             if not riego["valvula_abierta"]:
                 return
+            # El caudal varía un poco alrededor de 12 l/min para que parezca real
             caudal = round(CAUDAL_NOMINAL + random.uniform(-1.5, 1.5), 2)
             riego["caudal"] = caudal
             riego["volumen"] += caudal / 60      # l/min -> litros en 1 segundo
@@ -175,9 +199,11 @@ def bucle_caudalimetro():
             return
 
 
-#Teclado
+# ------------------------------------------------------------
+#  Teclado
+# ------------------------------------------------------------
+# Va en su propio hilo para que esperar una tecla no pare lo demás
 def keyboard_listener():
-    """Escucha la pulsación de teclas en la terminal."""
     global simular_fuga
     while True:
         try:
@@ -185,12 +211,13 @@ def keyboard_listener():
         except EOFError:
             return
         if cmd == 'k':
+            # Avería: cortamos el riego y en el próximo HEALTH? contestamos KO
             simular_fuga = True
             print("\n[ENGINE] ¡FALLO FORZADO! En el próximo pulso de salud se enviará 'KO'...\n")
             cerrar_valvula("FUGA")
         elif cmd.startswith('a'):
-            # Riego manual desde la estación: NO abrimos directamente, se lo pedimos
-            # a CENTRAL como si fuéramos un operario, para que valide y lo registre.
+            # Riego manual: no abrimos directamente, se lo pedimos a Central
+            # como si fuéramos un operario, para que lo valide y lo registre
             if not monitor_conectado:
                 print("[ENGINE] ESTACIÓN AVERIADA: sin monitor. No se admiten riegos.")
                 continue
@@ -208,21 +235,24 @@ def keyboard_listener():
             print("\n[ENGINE] Avería reparada. En el próximo pulso de salud se enviará 'OK'.\n")
 
 
-#ordenes por kafka
+# ------------------------------------------------------------
+#  Órdenes de Central por Kafka
+# ------------------------------------------------------------
+
+# Hilo que lee las órdenes (ABRIR, CERRAR) y las respuestas de Central.
+# También recoge el LATIDO de Central para saber si sigue viva
 def escuchar_ordenes(broker):
-    """Hilo consumidor: obedece las órdenes para esta estación y muestra las
-    respuestas de CENTRAL a los riegos manuales pedidos desde aquí."""
     global ultimo_latido, desfase_central
     consumer = KafkaConsumer(
         bootstrap_servers=[broker],
-        group_id=f"wm_engine_{ws_id}",   # un grupo propio por estación
+        group_id=f"wm_engine_{ws_id}",   # un grupo propio para cada estación
         auto_offset_reset="latest",      # solo órdenes nuevas
-        metadata_max_age_ms=3000,        # detectar pronto el topic si se crea después
+        metadata_max_age_ms=3000,        # refresca la información de Kafka cada 3 s
         value_deserializer=lambda b: json.loads(b.decode("utf-8")),
     )
     consumer.subscribe([TOPIC_ORDENES, TOPIC_RESPUESTAS])
-    # Al arrancar, ignoramos las órdenes que se quedaron en Kafka con el Engine apagado
-    # (no hay que abrir la válvula por un ABRIR de hace rato)
+    # Al arrancar saltamos al final de los topics: no queremos abrir la
+    # válvula por un ABRIR que se quedó en Kafka mientras estábamos apagados
     limite = time.time() + 30
     while not consumer.assignment() and time.time() < limite:
         consumer.poll(timeout_ms=200)
@@ -236,24 +266,26 @@ def escuchar_ordenes(broker):
             for msg in registros:
                 orden = msg.value
                 if msg.topic == TOPIC_RESPUESTAS:
-                    # Solo nos interesan las respuestas a NUESTRAS peticiones manuales
                     if orden.get("tipo") == "LATIDO":
                         ultimo_latido = time.time()
-                        # El LATIDO lleva la hora de CENTRAL: así sabemos cuánto se
-                        # desvía nuestro reloj del suyo (incluye unas décimas de red)
+                        # El LATIDO lleva la hora de Central: comparándola con la
+                        # nuestra sabemos cuánto se desvía nuestro reloj del suyo
                         desfase_central = time.time() - orden.get("ts", time.time())
                     elif orden.get("op_id") == f"MANUAL-{ws_id}":
+                        # Respuesta a un riego manual pedido desde esta estación
                         print(f"[ENGINE] CENTRAL ({orden.get('tipo')}): {orden.get('mensaje')}")
                     continue
                 if orden.get("ws_id") != ws_id:
                     continue        # la orden es para otra estación
-                # Antigüedad medida con la hora de CENTRAL (nuestro reloj corregido por
-                # el desfase), para que un PC con la hora mal no descarte órdenes buenas
+                # La antigüedad se calcula con la hora de Central (nuestro reloj
+                # corregido con el desfase). Así, aunque el PC tenga la hora mal,
+                # no descartamos órdenes buenas
                 if (time.time() - desfase_central) - orden.get("ts", 0) > MAX_ANTIGUEDAD_ORDEN:
-                    continue        # orden caducada
+                    continue        # orden demasiado vieja
                 procesar_orden(orden)
 
 
+# Hilo que avisa si Central deja de mandar su LATIDO durante más de 6 s
 def vigilar_central():
     caida = False
     while True:
@@ -274,6 +306,7 @@ def procesar_orden(orden):
         ok, motivo = abrir_valvula(int(orden.get("duracion", 10)),
                                    orden.get("op_id"), orden.get("req_id"))
         if not ok:
+            # No hemos podido abrir: se lo decimos a Central para que deniegue
             print(f"[ENGINE] Rechazada: {motivo}")
             publicar(TOPIC_TELEMETRIA, {"tipo": "RECHAZO", "motivo": motivo,
                                         "op_id": orden.get("op_id"),
@@ -283,13 +316,13 @@ def procesar_orden(orden):
         cerrar_valvula(orden.get("motivo", "ORDEN_CENTRAL"))
 
 
-#cierra la ventana
+# ------------------------------------------------------------
+#  Cerrar la válvula si se cierra la ventana o se para el proceso
+# ------------------------------------------------------------
 def instalar_cierre_ventana():
-    """Hace que, si se cierra la ventana (la X) o se mata el proceso, se cierre
-    la electroválvula y se publique el FIN antes de morir."""
     if sys.platform == "win32":
-        # En Windows, cerrar la ventana NO llega a Python como señal: hay que
-        # registrarse en la consola con la función SetConsoleCtrlHandler de Windows.
+        # En Windows, cerrar la ventana (la X) no le llega a Python como una
+        # señal normal: hay que registrarse en la consola con SetConsoleCtrlHandler
         import ctypes
         CTRL_CLOSE_EVENT = 2       # código que manda Windows al pulsar la X
         TipoManejador = ctypes.WINFUNCTYPE(ctypes.c_int, ctypes.c_uint)
@@ -297,16 +330,16 @@ def instalar_cierre_ventana():
         def manejador(evento):
             if evento == CTRL_CLOSE_EVENT:
                 cerrar_valvula("CIERRE_VENTANA")
-                return 1           # "lo he gestionado yo"
-            return 0               # Ctrl+C y demás: que lo gestione Python como siempre
+                return 1           # lo hemos gestionado nosotros
+            return 0               # Ctrl+C y lo demás lo gestiona Python como siempre
 
-        # Guardamos la referencia en una global: si Python la borrara, Windows
-        # llamaría a una función que ya no existe y el programa reventaría.
+        # Se guarda en una variable global: si Python la borrara, Windows
+        # llamaría a una función que ya no existe y el programa se rompería
         global _manejador_windows
         _manejador_windows = TipoManejador(manejador)
         ctypes.windll.kernel32.SetConsoleCtrlHandler(_manejador_windows, True)
     else:
-        # Linux / macOS / Docker: cerrar la ventana manda SIGHUP; docker stop manda SIGTERM
+        # Linux / Mac / Docker: cerrar la ventana manda SIGHUP y docker stop manda SIGTERM
         def manejador_senal(signum, frame):
             motivo = "CIERRE_VENTANA" if signum == signal.SIGHUP else "PROCESO_DETENIDO"
             cerrar_valvula(motivo)
@@ -315,6 +348,7 @@ def instalar_cierre_ventana():
         signal.signal(signal.SIGTERM, manejador_senal)
 
 
+# Si perdemos el monitor, lo volvemos a intentar cada 3 s hasta que vuelva
 def reconectar_monitor(ip, puerto):
     while True:
         time.sleep(3)
@@ -330,6 +364,9 @@ def reconectar_monitor(ip, puerto):
         print(f"[ENGINE] Monitor no disponible en {ip}:{puerto}. Reintentando en 3 s...")
 
 
+# ------------------------------------------------------------
+#  Programa principal
+# ------------------------------------------------------------
 if __name__ == "__main__":
     if len(sys.argv) < 4:
         print("Uso: py WM_WS_E.py <ip_broker:puerto> <ip_monitor> <puerto_monitor>")
@@ -346,7 +383,7 @@ if __name__ == "__main__":
 
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     try:
-        #Conexión con el Monitor y recepción del ID
+        # 1. Nos conectamos al monitor y él nos dice qué estación somos
         sock.connect((ip_monitor, puerto_monitor))
         print(f"[ENGINE] Conectado al Monitor en {ip_monitor}:{puerto_monitor}")
         primera = sock.recv(1024).decode("utf-8").strip()
@@ -357,7 +394,7 @@ if __name__ == "__main__":
         print(f"[ENGINE] Estación asignada: {ws_id}")
         monitor_conectado = True
 
-        #Conexión con Kafka
+        # 2. Conexión con Kafka
         try:
             producer = KafkaProducer(
                 bootstrap_servers=[broker],
@@ -371,25 +408,24 @@ if __name__ == "__main__":
             print(f"[ENGINE] Error: no hay ningún Kafka escuchando en {broker}")
             sys.exit(1)
         print(f"[ENGINE] Conectado a Kafka en {broker}")
-        recuperar_riego()
+        recuperar_riego()   # por si nos caímos a mitad de un riego
 
-        #Hilo que escucha las órdenes de Central
+        # 3. Hilos: órdenes de Central y vigilancia del latido
         threading.Thread(target=escuchar_ordenes, args=(broker,), daemon=True).start()
         ultimo_latido = time.time()
         threading.Thread(target=vigilar_central, daemon=True).start()
 
-        #A partir de aquí, cerrar la ventana cierra la válvula de forma ordenada
+        # A partir de aquí, cerrar la ventana cierra la válvula de forma ordenada
         instalar_cierre_ventana()
 
         print("[ENGINE] Respondiendo 'OK' a los pulsos de salud.")
         print(f"[ENGINE] PID: {os.getpid()}")
         print("[ENGINE] Teclas: k = avería | o = reparar avería | a <seg> = pedir riego manual a CENTRAL | p = parar riego\n")
 
-        #Hilo para leer el teclado en paralelo
         threading.Thread(target=keyboard_listener, daemon=True).start()
 
-        #Bucle principal: pulsos de salud del Monitor
-        sock.settimeout(1.0)   # recv espera como mucho 1 s: así Ctrl+C funciona en Windows
+        # 4. Bucle principal: contestar a los HEALTH? del monitor
+        sock.settimeout(1.0)   # recv espera como mucho 1 s, así Ctrl+C funciona también en Windows
         while True:
             try:
                 data = sock.recv(1024)
@@ -398,6 +434,8 @@ if __name__ == "__main__":
             except OSError:
                 data = b""
             if not data:
+                # Se ha caído el monitor: la estación queda averiada, cortamos el
+                # riego y esperamos a que vuelva
                 monitor_conectado = False
                 print("\n[ENGINE] ESTACIÓN AVERIADA: se ha perdido el Monitor.")
                 cerrar_valvula("MONITOR_CAIDO")
@@ -415,8 +453,9 @@ if __name__ == "__main__":
                     else:
                         sock.sendall(b"OK")
                 except OSError:
-                    # El Monitor ya cerró el socket (p. ej. nos dio por muertos por timeout).
-                    # No salimos: en la siguiente vuelta recv() devolverá b"" y se reconecta.
+                    # El monitor ya había cerrado el socket (por ejemplo, porque
+                    # tardamos en contestar). En la siguiente vuelta recv()
+                    # devolverá b"" y nos reconectaremos
                     continue
     except ConnectionRefusedError:
         print(f"[ENGINE] Error: El Monitor no está escuchando en {ip_monitor}:{puerto_monitor}")
@@ -425,10 +464,11 @@ if __name__ == "__main__":
     except Exception as e:
         print(f"[ENGINE] Desconexión: {e}")
     finally:
+        # Pase lo que pase, nunca dejamos el agua abierta al salir
         if producer:
-            cerrar_valvula("PROCESO_DETENIDO")   #nunca dejar el agua corriendo al salir
+            cerrar_valvula("PROCESO_DETENIDO")
             try:
-                producer.close(timeout=3)        #envía lo pendiente y suelta la conexión con Kafka
+                producer.close(timeout=3)   # envía lo pendiente y suelta la conexión con Kafka
             except Exception:
                 pass
         sock.close()
