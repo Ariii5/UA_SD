@@ -45,8 +45,8 @@ ultimo_latido = time.time() # última vez que recibimos el LATIDO de Central
 DIR_DATOS = os.path.join(os.path.dirname(os.path.abspath(__file__)), "datos")
 
 
-# Publica un mensaje en Kafka añadiéndole nuestro ID y la hora
-def publicar(topic, mensaje):
+#Publica un mensaje en Kafka añadiéndole nuestro ID y la hora
+def publicar(topic, mensaje): #se llama cada segundo, si esperan la confirmación con flush, el caudalimetro se retrasaria
     mensaje["ws_id"] = ws_id
     mensaje["ts"] = time.time()
     try:
@@ -55,13 +55,11 @@ def publicar(topic, mensaje):
         print(f"[ENGINE] Error publicando en Kafka: {e}")
 
 
-# ------------------------------------------------------------
+
 #  Fichero del riego en curso (para no perder lo regado)
-# ------------------------------------------------------------
 # Mientras riega, cada segundo guardamos en datos/riego_WS-XX.json lo que
 # llevamos. Si el programa muere de golpe, al volver a arrancar lo leemos y
 # mandamos a Central el final de ese riego
-
 def fichero_estado():
     return os.path.join(DIR_DATOS, f"riego_{ws_id}.json")
 
@@ -95,15 +93,14 @@ def recuperar_riego():
                                 "duracion": datos["duracion"], "litros": datos["litros"],
                                 "op_id": datos["op_id"], "req_id": datos["req_id"]})
     try:
-        producer.flush(timeout=5)
+        producer.flush(timeout=5) #es importante que llegue para borrar el estado
         borrar_estado()
     except Exception:
         print("[ENGINE] No se pudo enviar el estado final; se reintentará en el próximo arranque.")
 
 
-# ------------------------------------------------------------
-#  Electroválvula y caudalímetro
-# ------------------------------------------------------------
+
+#Electroválvula y caudalímetro
 CAUDAL_NOMINAL = 12.0   # litros por minuto con la válvula abierta
 
 # 'riego' lo tocan varios hilos (órdenes de Kafka, teclado, caudalímetro),
@@ -122,7 +119,7 @@ riego = {
 
 # Abre la válvula si se puede. Devuelve (True, "") o (False, motivo del rechazo)
 def abrir_valvula(duracion, op_id=None, req_id=None):
-    with lock:
+    with lock: #permite operar sobre riego, cuando deja la función, libera la llave lock
         if not monitor_conectado:
             return False, "La estación está averiada (sin monitor)"
         if simular_fuga:
@@ -136,7 +133,7 @@ def abrir_valvula(duracion, op_id=None, req_id=None):
         riego["volumen"] = 0.0
         riego["op_id"] = op_id
         riego["req_id"] = req_id
-    print(f"\n[ENGINE] >>> ELECTROVÁLVULA ABIERTA (operario {op_id}, límite {duracion}s)")
+    print(f"\n[ENGINE] >>> ELECTROVÁLVULA ABIERTA (operario {op_id}, límite {duracion}s)") #aqui se suelta la llave
     # Avisamos a Central de que hemos abierto (con esto autoriza al operario)
     publicar(TOPIC_TELEMETRIA, {"tipo": "INICIO", "duracion_max": duracion,
                                 "op_id": op_id, "req_id": req_id})
@@ -148,10 +145,10 @@ def abrir_valvula(duracion, op_id=None, req_id=None):
 def cerrar_valvula(motivo):
     with lock:
         if not riego["valvula_abierta"]:
-            return
+            return #si ya está cerrada no hace nada, para no enviar 2 FIN
         riego["valvula_abierta"] = False
         riego["caudal"] = 0.0
-        duracion = round(time.time() - riego["inicio"], 1)
+        duracion = round(time.time() - riego["inicio"], 1) #redondeo 1 decimal
         litros = round(riego["volumen"], 2)
         op_id = riego["op_id"]
         req_id = riego["req_id"]
@@ -173,10 +170,10 @@ def cerrar_valvula(motivo):
 # caudal, suma los litros, lo guarda en el fichero y lo publica
 def bucle_caudalimetro():
     while True:
-        time.sleep(1)
+        time.sleep(1) #cada vuelta espera 1 segundo para no petar la terminal
         with lock:
             if not riego["valvula_abierta"]:
-                return
+                return #si esta cerrada sale
             # El caudal varía un poco alrededor de 12 l/min para que parezca real
             caudal = round(CAUDAL_NOMINAL + random.uniform(-1.5, 1.5), 2)
             riego["caudal"] = caudal
@@ -199,16 +196,15 @@ def bucle_caudalimetro():
             return
 
 
-# ------------------------------------------------------------
-#  Teclado
-# ------------------------------------------------------------
+
+#Teclado
 # Va en su propio hilo para que esperar una tecla no pare lo demás
 def keyboard_listener():
     global simular_fuga
-    while True:
+    while True: #espera detectar teclas siempre
         try:
-            cmd = input().strip().lower()
-        except EOFError:
+            cmd = input().strip().lower() #quita espacios y lo pasa a minusculas
+        except EOFError: #si no hay teclado
             return
         if cmd == 'k':
             # Avería: cortamos el riego y en el próximo HEALTH? contestamos KO
@@ -235,9 +231,8 @@ def keyboard_listener():
             print("\n[ENGINE] Avería reparada. En el próximo pulso de salud se enviará 'OK'.\n")
 
 
-# ------------------------------------------------------------
-#  Órdenes de Central por Kafka
-# ------------------------------------------------------------
+
+#Órdenes de Central por Kafka
 
 # Hilo que lee las órdenes (ABRIR, CERRAR) y las respuestas de Central.
 # También recoge el LATIDO de Central para saber si sigue viva
@@ -250,14 +245,15 @@ def escuchar_ordenes(broker):
         metadata_max_age_ms=3000,        # refresca la información de Kafka cada 3 s
         value_deserializer=lambda b: json.loads(b.decode("utf-8")),
     )
-    consumer.subscribe([TOPIC_ORDENES, TOPIC_RESPUESTAS])
+    consumer.subscribe([TOPIC_ORDENES, TOPIC_RESPUESTAS]) #las ordenes de la central | el latido de central y la respuesta a los riegos manueales
     # Al arrancar saltamos al final de los topics: no queremos abrir la
     # válvula por un ABRIR que se quedó en Kafka mientras estábamos apagados
     limite = time.time() + 30
     while not consumer.assignment() and time.time() < limite:
         consumer.poll(timeout_ms=200)
     if consumer.assignment():
-        consumer.seek_to_end(*consumer.assignment())
+        consumer.seek_to_end(*consumer.assignment()) #empieza a leer a partir de ahora, para no repetir los denegados de antes al no ejecutarse
+                            #pasa TODOS los buzones asignados como parametros
         for tp in consumer.assignment():
             consumer.position(tp)
     while True:
@@ -292,10 +288,10 @@ def vigilar_central():
         time.sleep(1)
         if time.time() - ultimo_latido > 6:
             if not caida:
-                print("\n[ENGINE] ✖ Imposible conectar con WM_Central / gestor de colas.")
+                print("\n[ENGINE] X Imposible conectar con WM_Central / gestor de colas.")
                 caida = True
         elif caida:
-            print("\n[ENGINE] ✔ WM_Central vuelve a estar disponible.")
+            print("\n[ENGINE]  WM_Central vuelve a estar disponible.")
             caida = False
 
 
@@ -316,9 +312,7 @@ def procesar_orden(orden):
         cerrar_valvula(orden.get("motivo", "ORDEN_CENTRAL"))
 
 
-# ------------------------------------------------------------
-#  Cerrar la válvula si se cierra la ventana o se para el proceso
-# ------------------------------------------------------------
+#Cerrar la válvula si se cierra la ventana o se para el proceso
 def instalar_cierre_ventana():
     if sys.platform == "win32":
         # En Windows, cerrar la ventana (la X) no le llega a Python como una
@@ -327,7 +321,7 @@ def instalar_cierre_ventana():
         CTRL_CLOSE_EVENT = 2       # código que manda Windows al pulsar la X
         TipoManejador = ctypes.WINFUNCTYPE(ctypes.c_int, ctypes.c_uint)
 
-        def manejador(evento):
+        def manejador(evento): #la llama windows al pulsar la X
             if evento == CTRL_CLOSE_EVENT:
                 cerrar_valvula("CIERRE_VENTANA")
                 return 1           # lo hemos gestionado nosotros
@@ -344,29 +338,29 @@ def instalar_cierre_ventana():
             motivo = "CIERRE_VENTANA" if signum == signal.SIGHUP else "PROCESO_DETENIDO"
             cerrar_valvula(motivo)
             sys.exit(0)
-        signal.signal(signal.SIGHUP, manejador_senal)
+        signal.signal(signal.SIGHUP, manejador_senal) #en vez de morirse, ejecuta esa funcion
         signal.signal(signal.SIGTERM, manejador_senal)
 
 
 # Si perdemos el monitor, lo volvemos a intentar cada 3 s hasta que vuelva
 def reconectar_monitor(ip, puerto):
     while True:
-        time.sleep(3)
+        time.sleep(3) #sin esto, lo intentaria miles de veces hasta comerse el procesador
         try:
             s = socket.create_connection((ip, puerto), timeout=3)
             s.settimeout(5)
-            if s.recv(1024).decode("utf-8").startswith("ID#"):
+            if s.recv(1024).decode("utf-8").startswith("ID#"): #si ha conectado, espera el saludo del monitor
+                                            #solo verifica que tenga id porque cada monitor tiene su puerto, asiq se conecta al mismo monitor
                 s.settimeout(1.0)
-                return s
+                return s #devuelve la llamada nueva
             s.close()
-        except OSError:
+        except OSError: #si el monitor aun no está encecndido
             pass
         print(f"[ENGINE] Monitor no disponible en {ip}:{puerto}. Reintentando en 3 s...")
 
 
-# ------------------------------------------------------------
-#  Programa principal
-# ------------------------------------------------------------
+
+#Programa principal
 if __name__ == "__main__":
     if len(sys.argv) < 4:
         print("Uso: py WM_WS_E.py <ip_broker:puerto> <ip_monitor> <puerto_monitor>")
@@ -381,14 +375,14 @@ if __name__ == "__main__":
     print("      SIMULADOR DEL MOTOR (WM_WS_E)")
     print("=" * 50)
 
-    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM) #red y dir ip
     try:
-        # 1. Nos conectamos al monitor y él nos dice qué estación somos
+        #1. Nos conectamos al monitor y él nos dice qué estación somos
         sock.connect((ip_monitor, puerto_monitor))
         print(f"[ENGINE] Conectado al Monitor en {ip_monitor}:{puerto_monitor}")
         primera = sock.recv(1024).decode("utf-8").strip()
         if not primera.startswith("ID#"):
-            print(f"[ENGINE] Error: esperaba ID#<id> y llegó {primera!r}")
+            print(f"[ENGINE] Error: esperaba ID#<id> y llegó {primera!r}") #!r para ver qué llegó exactmanete
             sys.exit(1)
         ws_id = primera.split("#", 1)[1]
         print(f"[ENGINE] Estación asignada: {ws_id}")
