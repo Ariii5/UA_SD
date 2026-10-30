@@ -174,15 +174,15 @@ def solicitar_riego(ws_id, duracion):
     vaciar_bandeja()
     riego_activo.update(req_id=req_id, ws_id=ws_id)
     print(f"\n[FO {op_id}] Solicitando riego en {ws_id} durante {duracion}s (petición {req_id})")
-    if not enviar({"tipo": "SOLICITUD", "req_id": req_id, "op_id": op_id,
+    if not enviar({"tipo": "SOLICITUD", "req_id": req_id, "op_id": op_id, #si enviar devuelve false
                    "ws_id": ws_id, "duracion": duracion}):
-        riego_activo.update(req_id=None, ws_id=None)
+        riego_activo.update(req_id=None, ws_id=None) #esta caido kafka
         return False
 
     autorizado = False
     try:
         while True:
-            #Antes de autorizar esperamos 15 s; durante el riego, 10 s entre mensajes
+            #Antes de autorizar esperamos 15 s; durante el riego, 10 s entre mensajes telemetría
             espera = TIMEOUT_TELEMETRIA if autorizado else TIMEOUT_RESPUESTA
             try:
                 m = bandeja.get(timeout=espera)
@@ -192,7 +192,7 @@ def solicitar_riego(ws_id, duracion):
                 else:
                     print(f"[FO {op_id}] X Imposible conectar con WM_Central. Petición abandonada.")
                 return False
-            if m.get("req_id") != req_id:
+            if m.get("req_id") != req_id: #si no es mi riego, pasa al siguiente
                 continue
             tipo = m.get("tipo")
             if tipo == "INFO":
@@ -223,7 +223,7 @@ def solicitar_riego(ws_id, duracion):
 def listar_estaciones():
     req_id = f"{op_id}-{uuid.uuid4().hex[:8]}"
     vaciar_bandeja()
-    riego_activo.update(req_id=req_id, ws_id=None)
+    riego_activo.update(req_id=req_id, ws_id=None) #estacion a none porque no es riego
 
     try:
         if not enviar({"tipo": "LISTAR", "req_id": req_id, "op_id": op_id}):
@@ -238,9 +238,9 @@ def listar_estaciones():
                 print("\n  ID      UBICACIÓN               ESTADO")
                 for e in m["estaciones"]:
                     marca = "  <- disponible" if e["estado"] == "DISPONIBLE" else ""
-                    print(f"  {e['ws_id']:<7} {e['ubicacion']:<23} {e['estado']}{marca}")
+                    print(f"  {e['ws_id']:<7} {e['ubicacion']:<23} {e['estado']}{marca}") #el <7 y <23 para que el texto ocupe siempre 7 y 23 carácteres para que se alinee
                 return
-        print(f"[FO {op_id}] X Imposible conectar con WM_Central.")
+        print(f"[FO {op_id}] X Imposible conectar con WM_Central.") #para el break
     finally:
         riego_activo.update(req_id=None, ws_id=None)
 
@@ -253,14 +253,14 @@ def leer_fichero(ruta):
     # Al copiar una ruta en Windows se añaden comillas: las quitamos
     ruta = ruta.strip().strip('"').strip("'")
     try:
-        with open(ruta, encoding="utf-8") as f:
-            for n, linea in enumerate(f, 1):
-                linea = linea.strip()
-                if not linea or linea.startswith("#"):
+        with open(ruta, encoding="utf-8") as f: #with cierra fichero cuando se acaba de leer
+            for n, linea in enumerate(f, 1): #(f,1) asigna número, n=1, n=2...
+                linea = linea.strip() #quita salto de linea
+                if not linea or linea.startswith("#"): #ignora vacias o las que empiezan por #
                     continue
                 try:
                     ws_id, duracion = [p.strip() for p in linea.split(",")]
-                    peticiones.append((ws_id.upper(), int(duracion)))
+                    peticiones.append((ws_id.upper(), int(duracion))) #tranforma 8 letra en 8 int y añade pareja a la lista
                 except ValueError:
                     print(f"[FO {op_id}] Línea {n} ignorada (formato esperado WS-01,15): {linea!r}")
     except OSError as e:
@@ -269,11 +269,11 @@ def leer_fichero(ruta):
     return peticiones
 
 
-# Modo fichero: lanza las peticiones de una en una y espera 4 s entre ellas,
-# tanto si la anterior ha ido bien como si no
+#Modo fichero: lanza las peticiones de una en una y espera 4 s entre ellas,
+#tanto si la anterior ha ido bien como si no
 def modo_fichero(ruta):
     peticiones = leer_fichero(ruta)
-    if peticiones is None:
+    if peticiones is None: #el archivo no se pudo abrir
         return
     # chr(34) es la comilla doble y chr(39) la simple
     print(f"[FO {op_id}] {len(peticiones)} peticiones cargadas de {ruta.strip().strip(chr(34)).strip(chr(39))}")
@@ -283,7 +283,7 @@ def modo_fichero(ruta):
         print(f"[FO {op_id}] Servicio {i} {'COMPLETADO' if ok else 'FALLIDO'}.")
         if i < len(peticiones):
             print(f"[FO {op_id}] Esperando {ESPERA_ENTRE_SERVICIOS}s antes del siguiente...")
-            time.sleep(ESPERA_ENTRE_SERVICIOS)
+            time.sleep(ESPERA_ENTRE_SERVICIOS) #esperar 4 segundos entre riegos, enunciado, menos el último
     print(f"\n[FO {op_id}] Fichero terminado.")
 
 
@@ -301,8 +301,8 @@ def modo_interactivo():
             return
         if opcion == "1":
             ws_id = input("  ID de la estación (ej. WS-01): ").strip().upper()
-            dur = input("  Duración en segundos [10]: ").strip()
-            solicitar_riego(ws_id, int(dur) if dur.isdigit() else 10)
+            dur = input("  Duración en segundos [10]: ").strip() #strip quita espacios
+            solicitar_riego(ws_id, int(dur) if dur.isdigit() else 10) #si no escribes nada, 10 seg, isdigit comprueba números, sino 10 seg
         elif opcion == "2":
             listar_estaciones()
         elif opcion == "3":
