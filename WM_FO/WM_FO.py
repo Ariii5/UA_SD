@@ -4,7 +4,8 @@
 #  El operario habla con Central solo por Kafka:
 #   - escribe sus peticiones (SOLICITUD, LISTAR) en wm_solicitudes
 #   - lee las respuestas de Central en wm_respuestas
-#   - lee la telemetría de su riego en wm_telemetria
+#   - la telemetría de su riego también le llega por wm_respuestas: el
+#     Engine se la manda a Central y Central se la reenvía
 #
 #  Tiene dos modos:
 #   - Interactivo: menú para pedir riegos y ver las estaciones
@@ -20,11 +21,13 @@
 #    <ID_ESTACION>,<DURACION_EN_SEGUNDOS>
 #    WS-01,15
 # ============================================================
+import os
 import sys
 import json
 import time
 import uuid
 import queue
+import socket
 import argparse
 import threading
 
@@ -34,8 +37,7 @@ import logging
 logging.getLogger("kafka").addHandler(logging.NullHandler())   # para que kafka-python no llene la pantalla de avisos
 
 TOPIC_SOLICITUDES = "wm_solicitudes"   # FO -> Central
-TOPIC_RESPUESTAS = "wm_respuestas"     # Central -> FO
-TOPIC_TELEMETRIA = "wm_telemetria"     # Engine -> Central y FO
+TOPIC_RESPUESTAS = "wm_respuestas"     # Central -> FO (respuestas, telemetría reenviada y LATIDO)
 
 ESPERA_ENTRE_SERVICIOS = 4      # segundos entre peticiones en el modo fichero
 TIMEOUT_RESPUESTA = 15          # si Central no contesta en 15 s, damos la petición por perdida
@@ -43,6 +45,8 @@ TIMEOUT_TELEMETRIA = 10         # si durante un riego no llega telemetría en 10
 
 op_id = None        # nuestro ID (FO-01...), se pone al arrancar
 producer = None     # productor de Kafka, se crea al arrancar
+mi_ip = None        #IP del operario, va en los mensajes para la auditoría de Central
+central_caida = False   #mientras sea True no se mandan peticiones nuevas
 
 # Cola donde el hilo consumidor deja los mensajes de la petición en curso
 # y el hilo principal los va recogiendo. queue.Queue ya está preparada para
@@ -68,7 +72,7 @@ def crear_consumidor(broker):
         metadata_max_age_ms=3000,       #refresca la información de Kafka cada 3 s, hay topics nuevos?
         value_deserializer=lambda b: json.loads(b.decode("utf-8")),   # de bytes JSON a diccionario
     )
-    consumer.subscribe([TOPIC_RESPUESTAS, TOPIC_TELEMETRIA]) #no se apunta a solicitudes porque ahí escribe, aquí lee
+    consumer.subscribe([TOPIC_RESPUESTAS]) #no se apunta a solicitudes porque ahí escribe, aquí lee. La telemetría llega por Central
     #Esperamos a que Kafka nos asigne los topics ANTES de mandar nada.
     #Si no, la respuesta de Central podría llegar antes de estar escuchando
     limite = time.time() + 30
@@ -91,7 +95,7 @@ def hilo_consumidor(consumer):
 #   LATIDO de Central             -> apuntamos que Central sigue viva
 #   respuesta para nosotros       -> a la bandeja si es de la petición en curso,
 #                                    si no, es de una anterior y la enseñamos aparte
-#   telemetría de nuestro riego   -> a la bandeja
+#   (la telemetría de nuestro riego es una respuesta más, la reenvía Central)
 def procesar_lotes(consumer, lotes):
     global ultimo_latido
     for registros in lotes.values():
@@ -99,14 +103,11 @@ def procesar_lotes(consumer, lotes):
             m = r.value
             if m.get("tipo") == "LATIDO":
                 ultimo_latido = time.time()
-            elif r.topic == TOPIC_RESPUESTAS and m.get("op_id") == op_id:
+            elif m.get("op_id") == op_id:
                 if m.get("req_id") == riego_activo["req_id"]:
                     bandeja.put(m)
                 else:
                     mostrar_pendiente(m) #el riego no es uno activo, muestra resumen
-            elif (r.topic == TOPIC_TELEMETRIA and m.get("tipo") == "TELEMETRIA"
-                  and m.get("req_id") == riego_activo["req_id"]):
-                bandeja.put(m)
     # Guardamos en Kafka hasta dónde hemos leído
     if lotes:
         try:
@@ -131,23 +132,42 @@ def mostrar_pendiente(m):
         print(f"   {m.get('tipo')} - {m.get('mensaje')}")
 
 
-#Hilo que avisa si Central deja de mandar su LATIDO durante más de 6 s
+#Hilo que vigila el LATIDO de Central. Si en 6 s no llega, el FO se para:
+#corta la espera del riego en curso y no manda peticiones nuevas hasta que vuelva
 def vigilar_central():
-    caida = False
+    global central_caida
     while True:
         time.sleep(1) #sin esto el procesador daria millones de vueltas por segundo y se petaria
         if time.time() - ultimo_latido > 6:
-            if not caida:
-                print(f"\n[FO {op_id}] X Imposible conectar con WM_Central / gestor de colas. Esperando...")
-                caida = True
-        elif caida:
+            if not central_caida:
+                print(f"\n[FO {op_id}] X Imposible conectar con WM_Central / gestor de colas. FO parado hasta que vuelva.")
+                central_caida = True
+                if riego_activo["req_id"]:
+                    bandeja.put({"tipo": "CENTRAL_CAIDA", "req_id": riego_activo["req_id"]})
+        elif central_caida:
             print(f"\n[FO {op_id}]  WM_Central vuelve a estar disponible.")
-            caida = False
+            central_caida = False
+
+
+#IP de este operario. En Docker sale la del contenedor, por eso se puede
+#poner la del PC con la variable de entorno FO_IP
+def obtener_ip():
+    if os.environ.get("FO_IP"):
+        return os.environ["FO_IP"]
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.connect(("8.8.8.8", 80)) #no envía nada, solo mira por qué tarjeta de red saldría
+        ip = s.getsockname()[0]
+        s.close()
+        return ip
+    except OSError:
+        return "127.0.0.1"
 
 
 #Manda una petición a Central. Devuelve False si Kafka no responde
 def enviar(mensaje):
     mensaje["ts"] = time.time()
+    mensaje["ip"] = mi_ip
     try:
         producer.send(TOPIC_SOLICITUDES, key=op_id, value=mensaje) #no envia al instante
         producer.flush(timeout=5) #lo envia todo y el timeout es para esperar a que kafka confirme
@@ -169,6 +189,9 @@ def vaciar_bandeja():
 #Pide un riego y se queda esperando hasta que termina.
 #Devuelve True si acabó bien y False si se denegó o se perdió por el camino
 def solicitar_riego(ws_id, duracion):
+    if central_caida:
+        print(f"[FO {op_id}] X WM_Central no está disponible. No se envía la petición.")
+        return False
     #Cada petición lleva un id único para saber qué mensajes son suyos
     req_id = f"{op_id}-{uuid.uuid4().hex[:8]}"
     vaciar_bandeja()
@@ -195,6 +218,9 @@ def solicitar_riego(ws_id, duracion):
             if m.get("req_id") != req_id: #si no es mi riego, pasa al siguiente
                 continue
             tipo = m.get("tipo")
+            if tipo == "CENTRAL_CAIDA":
+                print(f"[FO {op_id}] X Se para el seguimiento del riego en {ws_id}: WM_Central no responde.")
+                return False
             if tipo == "INFO":
                 print(f"[FO {op_id}] · {m['mensaje']}")
             elif tipo == "DENEGADO":
@@ -221,6 +247,9 @@ def solicitar_riego(ws_id, duracion):
 
 #Pide a Central la lista de estaciones y la enseña. Espera la respuesta 5 s
 def listar_estaciones():
+    if central_caida:
+        print(f"[FO {op_id}] X WM_Central no está disponible.")
+        return
     req_id = f"{op_id}-{uuid.uuid4().hex[:8]}"
     vaciar_bandeja()
     riego_activo.update(req_id=req_id, ws_id=None) #estacion a none porque no es riego
@@ -278,6 +307,10 @@ def modo_fichero(ruta):
     # chr(34) es la comilla doble y chr(39) la simple
     print(f"[FO {op_id}] {len(peticiones)} peticiones cargadas de {ruta.strip().strip(chr(34)).strip(chr(39))}")
     for i, (ws_id, duracion) in enumerate(peticiones, 1):
+        if central_caida:
+            print(f"[FO {op_id}] Esperando a que vuelva WM_Central para seguir con el fichero...")
+            while central_caida:
+                time.sleep(1)
         print(f"\n[FO {op_id}] ---- Servicio {i}/{len(peticiones)} ----")
         ok = solicitar_riego(ws_id, duracion)
         print(f"[FO {op_id}] Servicio {i} {'COMPLETADO' if ok else 'FALLIDO'}.")
@@ -316,13 +349,14 @@ def modo_interactivo():
 
 def iniciar_operario():
     #global: queremos cambiar las variables de arriba, no crear unas nuevas dentro de la función
-    global op_id, producer, ultimo_latido
+    global op_id, producer, ultimo_latido, mi_ip
     parser = argparse.ArgumentParser(description="Aplicación del Operario (WM_FO)")
     parser.add_argument("--broker", required=True, help="IP y puerto de Kafka (ej: localhost:9092)")
     parser.add_argument("--id", required=True, help="ID único del operario (ej: FO-01)")
     parser.add_argument("--fichero", help="Fichero con peticiones (modo automático)")
     args = parser.parse_args()
     op_id = args.id
+    mi_ip = obtener_ip()
 
     print("=======================================")
     print(" INICIANDO TERMINAL DE OPERARIO")
