@@ -2,8 +2,8 @@
 FROM python:3.12-slim
 ENV PYTHONUNBUFFERED=1
 WORKDIR /app
-RUN pip install --no-cache-dir kafka-python==2.2.15
-COPY WM_WS_M.py WM_WS_E.py ./
+RUN pip install --no-cache-dir kafka-python==2.2.15 cryptography
+COPY WM_WS_M.py WM_WS_E.py cifrado.py ./
 
 # Valores por defecto; se cambian en "docker run" con -e NOMBRE=valor
 ENV BROKER=localhost:9092 \
