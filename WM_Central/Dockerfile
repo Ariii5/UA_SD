@@ -6,11 +6,12 @@ ENV PYTHONUNBUFFERED=1
 WORKDIR /app
 
 # Librerías necesarias: Kafka y Prompt Toolkit (panel interactivo sin parpadeo)
-RUN pip install --no-cache-dir kafka-python==2.2.15 prompt_toolkit
+RUN pip install --no-cache-dir kafka-python==2.2.15 prompt_toolkit cryptography
 
 # Copiar scripts del módulo central
 COPY db_manager.py .
 COPY WM_Central.py .
+COPY cifrado.py .
 
 # Puerto TCP de escucha para los monitores de estación
 EXPOSE 8000

@@ -248,7 +248,8 @@ def start_socket_server(port):
 TOPIC_SOLICITUDES = "wm_solicitudes"   # Operario/estación -> Central: SOLICITUD, LISTAR
 TOPIC_RESPUESTAS = "wm_respuestas"     # Central -> Operario: INFO, AUTORIZADO, DENEGADO, RESUMEN, LISTADO (y el LATIDO)
 TOPIC_ORDENES = "wm_ordenes"           # Central -> Engine: ABRIR, CERRAR
-TOPIC_TELEMETRIA = "wm_telemetria"     # Engine -> Central/Operario: INICIO, TELEMETRIA, FIN, RECHAZO
+TOPIC_TELEMETRIA = "wm_telemetria"     # Engine -> Central: INICIO, TELEMETRIA, FIN, RECHAZO (Central reenvía la telemetría al operario)
+NUM_PARTICIONES = 3                    #particiones de cada topic. La clave (ws_id u op_id) hace que lo de uno vaya siempre a la misma y llegue en orden
 
 TIMEOUT_APERTURA = 5      # segundos que esperamos a que el engine confirme que ha abierto (INICIO)
 TIMEOUT_SIN_NOTICIAS = 8  # segundos sin telemetría de un riego en curso -> lo damos por terminado
@@ -348,6 +349,7 @@ def procesar_evento_ws(ev):
 
     # Datos de caudal y volumen de cada segundo
     elif tipo == "TELEMETRIA":
+        sol = None
         with lock_riegos:
             act = activos.get(ws_id)
             if act and act["req_id"] == ev.get("req_id"):
@@ -355,8 +357,19 @@ def procesar_evento_ws(ev):
                 act["volumen"] = ev.get("volumen")
                 act["transcurrido"] = ev.get("transcurrido")
                 act["ultimo"] = time.time()   # última vez que supimos de este riego
+                sol = act["sol"]
         print(f"[CENTRAL-RIEGO] {ws_id} | {ev.get('caudal'):5.2f} l/min | "
               f"{ev.get('volumen'):7.2f} l | operario {ev.get('op_id')}")
+        #Se la reenviamos al operario: la telemetría le llega siempre a través
+        #de Central, así que si Central cae, al operario no le llega nada.
+        #A los riegos de Central y a los manuales no (no hay operario que la lea).
+        #Sin flush: llega una por segundo y no queremos frenar este hilo
+        op = str(sol.get("op_id")) if sol else ""
+        if sol and op != "CENTRAL" and not op.startswith("MANUAL-"):
+            producer.send(TOPIC_RESPUESTAS, key=op, value={
+                "tipo": "TELEMETRIA", "op_id": op, "req_id": sol.get("req_id"), "ws_id": ws_id,
+                "caudal": ev.get("caudal"), "volumen": ev.get("volumen"),
+                "transcurrido": ev.get("transcurrido"), "ts": time.time()})
 
     # Fin del riego: ponemos la estación en el estado que toque y mandamos el resumen
     elif tipo == "FIN":
@@ -500,14 +513,22 @@ def bucle_kafka(broker):
 # Crea los topics si no existen. Si falla no pasa nada: Kafka los crea solo
 def crear_topics(broker):
     try:
-        from kafka.admin import KafkaAdminClient, NewTopic
+        from kafka.admin import KafkaAdminClient, NewTopic, NewPartitions
         admin = KafkaAdminClient(bootstrap_servers=[broker])
+        topics = (TOPIC_SOLICITUDES, TOPIC_RESPUESTAS, TOPIC_ORDENES, TOPIC_TELEMETRIA)
         existentes = set(admin.list_topics())
-        nuevos = [NewTopic(name=t, num_partitions=1, replication_factor=1)
-                  for t in (TOPIC_SOLICITUDES, TOPIC_RESPUESTAS, TOPIC_ORDENES, TOPIC_TELEMETRIA)
-                  if t not in existentes]
+        nuevos = [NewTopic(name=t, num_partitions=NUM_PARTICIONES, replication_factor=1)
+                  for t in topics if t not in existentes]
         if nuevos:
             admin.create_topics(nuevos)
+        #Los que ya existían (por ejemplo en Railway, creados con 1 partición) se amplían
+        for t in topics:
+            if t in existentes:
+                try:
+                    admin.create_partitions({t: NewPartitions(total_count=NUM_PARTICIONES)})
+                    print(f"[CENTRAL-RIEGO] Topic {t} ampliado a {NUM_PARTICIONES} particiones.")
+                except Exception:
+                    pass   #ya tenía esas particiones (o más)
         admin.close()
     except Exception as e:
         print(f"[CENTRAL-RIEGO] Aviso: no se pudieron crear los topics ({e})")
