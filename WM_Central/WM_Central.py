@@ -42,6 +42,32 @@ from auditoria import auditar, obtener_eventos, ultimo_seq_auditoria
 import logging
 logging.getLogger("kafka").addHandler(logging.NullHandler())   # para que kafka-python no llene la pantalla de avisos
 
+
+# ------------------------------------------------------------
+#  Errores en la auditoría
+#  Los except de la Central, además de imprimir, registran un evento ERROR
+#  para que el panel (y el Front) puedan enseñarlo.
+#  Si el mismo error se repite (por ejemplo, Kafka caído: el bucle lo
+#  reintenta cada 2 s) solo se registra una vez por minuto, para no llenar
+#  el log con cientos de líneas iguales.
+# ------------------------------------------------------------
+REPETIR_ERROR_CADA = 60          # segundos
+lock_errores = threading.Lock()
+ultimos_errores = {}             # {(donde, texto del error): hora en que se registró}
+
+
+def auditar_error(donde, error, quien="CENTRAL", ip="-", datos=None):
+    clave = (donde, str(error))
+    ahora = time.time()
+    with lock_errores:
+        if ahora - ultimos_errores.get(clave, 0) < REPETIR_ERROR_CADA:
+            return   # ya lo registramos hace menos de un minuto
+        ultimos_errores[clave] = ahora
+    detalle = {"funcion": donde, "tipo_error": type(error).__name__, "error": str(error)}
+    if datos:
+        detalle.update(datos)
+    auditar("ERROR", f"Error en {donde}: {error}", nivel="ERROR", quien=quien, ip=ip, datos=detalle)
+
 # Bytes de control del protocolo con los monitores
 ENQ = b'\x05'   # el monitor lo manda al conectarse
 ACK = b'\x06'   # respuesta: OK
@@ -95,8 +121,9 @@ def notificar_monitor(ws_id: str, orden: str):
     if sock:
         try:
             sock.sendall(orden.encode("utf-8") + b"\n")
-        except Exception:
-            pass
+        except Exception as e:
+            # La orden no ha llegado al monitor (seguramente se acaba de caer)
+            auditar_error("notificar_monitor", e, quien=ws_id, datos={"orden": orden})
 
 TIMEOUT_MONITOR = 6     # si en 6 s no llega nada del monitor (ni un PING), la estación pasa a DESCONECTADA
 TIMEOUT_HANDSHAKE = 10  # tiempo máximo para hacer el saludo y el registro
@@ -240,6 +267,7 @@ def handle_monitor_client(client_socket, client_address):
 
     except Exception as e:
         print(f"[CENTRAL] Incidencia con {ws_id or client_address}: {e}")
+        auditar_error("handle_monitor_client", e, quien=ws_id or "DESCONOCIDO", ip=ip)
     finally:
         # Al salir (por el motivo que sea) quitamos el monitor de la lista y
         # marcamos la estación como DESCONECTADA. Solo si este socket es el
@@ -510,6 +538,7 @@ def vigilar_timeouts():
             # Si Kafka está caído, enviar() da error. Con el try el hilo sigue
             # vivo y lo vuelve a intentar en la siguiente vuelta
             print(f"[CENTRAL-RIEGO] Error vigilando timeouts (se reintenta): {e}")
+            auditar_error("vigilar_timeouts", e)
 
 
 # Al arrancar Central nos saltamos las peticiones que se quedaron en Kafka
@@ -552,12 +581,14 @@ def bucle_kafka(broker):
             procesar_evento_ws(msg.value)
         except Exception as e:
             print(f"[CENTRAL-RIEGO] Error procesando {msg.value}: {e}")
+            auditar_error("bucle_kafka", e, datos={"mensaje": msg.value})
     print(f"[CENTRAL-RIEGO] Escuchando '{TOPIC_SOLICITUDES}' y '{TOPIC_TELEMETRIA}' en {broker}")
     while True:
         try:
             lotes = consumer.poll(timeout_ms=500)
         except Exception as e:   # si Kafka se cae, esperamos y volvemos a intentar
             print(f"[CENTRAL-RIEGO] Error leyendo de Kafka (se reintenta): {e}")
+            auditar_error("bucle_kafka (leer de Kafka)", e)
             time.sleep(2)
             continue
         for registros in lotes.values():
@@ -573,6 +604,7 @@ def bucle_kafka(broker):
                         procesar_evento_ws(m)
                 except Exception as e:   # un mensaje mal formado no puede tirar Central
                     print(f"[CENTRAL-RIEGO] Error procesando {m}: {e}")
+                    auditar_error("bucle_kafka", e, datos={"mensaje": m})
 
 
 # Crea los topics si no existen. Si falla no pasa nada: Kafka los crea solo
@@ -597,6 +629,7 @@ def crear_topics(broker):
         admin.close()
     except Exception as e:
         print(f"[CENTRAL-RIEGO] Aviso: no se pudieron crear los topics ({e})")
+        auditar_error("crear_topics", e)
 
 
 # Hilo que publica un LATIDO cada 2 s. Los operarios y los engines lo usan
@@ -605,8 +638,8 @@ def latido():
     while True:
         try:
             producer.send(TOPIC_RESPUESTAS, key="CENTRAL", value={"tipo": "LATIDO", "ts": time.time()})
-        except Exception:
-            pass
+        except Exception as e:
+            auditar_error("latido", e)
         time.sleep(2)
 
 
@@ -621,8 +654,9 @@ def iniciar_kafka(broker):
             acks="all",
             retries=5,
         )
-    except NoBrokersAvailable:
+    except NoBrokersAvailable as e:
         print(f"[CENTRAL-RIEGO] AVISO: no hay Kafka en {broker}. Central funcionará solo con sockets.")
+        auditar_error("iniciar_kafka", e, datos={"broker": broker})
         return
     crear_topics(broker)
     threading.Thread(target=bucle_kafka, args=(broker,), daemon=True).start()
@@ -894,6 +928,7 @@ def ejecutar_comando_admin(command: str, publicar_mensaje):
             )
     except Exception as exc:
         publicar_mensaje(f"[ADMIN ERROR] {exc}")
+        auditar_error("ejecutar_comando_admin", exc, datos={"comando": command})
 
 
 # Panel de la terminal (solo cuando Central se lanza en una terminal, en local).
@@ -1527,6 +1562,7 @@ class ManejadorPanelWeb(http.server.BaseHTTPRequestHandler):
             mensajes = ejecutar_comando_web(datos)
             self._responder(200, "application/json", json.dumps({"mensajes": mensajes}))
         except Exception as e:
+            auditar_error("panel web /api/comando", e, quien="WEB", ip=self.client_address[0])
             self._responder(400, "application/json", json.dumps({"mensajes": [f"[ADMIN ERROR] {e}"]}))
 
 
