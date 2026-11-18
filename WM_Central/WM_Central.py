@@ -445,6 +445,10 @@ def procesar_evento_ws(ev):
         elif estado_actual == "REGANDO":
             actualizar_estado_estacion(ws_id, "DISPONIBLE")
 
+        # Sumamos los litros al total de la estación. También si no teníamos el
+        # riego apuntado (terminó con Central caída): el agua se ha gastado igual
+        sumar_litros(ws_id, ev.get("litros"))
+
         print(f"[CENTRAL-RIEGO] {ws_id} FIN de riego ({motivo}): "
               f"{ev.get('duracion')}s, {ev.get('litros')} l")
         # Si acabó por fuga o porque se cayó el monitor es AVISO; si no, INFO

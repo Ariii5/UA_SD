@@ -31,6 +31,17 @@ def init_db():
         )
     """)
 
+    # Columna con los litros que ha regado cada estación en total (Release 2).
+    # No va en el CREATE TABLE porque la tabla ya existe en las BD que tenemos
+    # (en local y en el volumen de Railway), y CREATE TABLE IF NOT EXISTS no
+    # cambia una tabla que ya existe. ALTER TABLE la añade; la segunda vez que
+    # arranca Central la columna ya está y SQLite da "duplicate column name",
+    # así que ese error lo ignoramos
+    try:
+        cursor.execute("ALTER TABLE estaciones ADD COLUMN litros_totales REAL DEFAULT 0")
+    except sqlite3.OperationalError:
+        pass   # la columna ya existía
+
     # Tabla de operarios
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS operarios (
@@ -123,6 +134,29 @@ def get_estado_estacion(ws_id):
     fila = cursor.fetchone()
     conn.close()
     return fila[0] if fila else None
+
+
+# Suma los litros de un riego terminado al total de la estación.
+# La suma la hace SQLite en una sola sentencia (litros_totales = litros_totales + ?),
+# así no hay que leer el valor, sumarlo en Python y volver a escribirlo: si dos
+# hilos lo hicieran a la vez, uno podría pisar la suma del otro.
+# Devuelve True si ha sumado algo y False si no (litros no válidos o estación que no existe)
+def sumar_litros(ws_id, litros):
+    try:
+        litros = float(litros)
+    except (TypeError, ValueError):
+        return False   # el engine mandó None o algo que no es un número
+    if litros <= 0:
+        return False   # nada que sumar (y un negativo restaría)
+
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    cursor.execute("UPDATE estaciones SET litros_totales = litros_totales + ? WHERE id = ?",
+                   (litros, ws_id))
+    sumado = cursor.rowcount == 1   # filas cambiadas: 0 si la estación no existe
+    conn.commit()
+    conn.close()
+    return sumado
 
 
 # ------------------------------------------------------------
