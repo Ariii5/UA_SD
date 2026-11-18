@@ -42,6 +42,15 @@ def init_db():
     except sqlite3.OperationalError:
         pass   # la columna ya existía
 
+    # Columna registrada (Release 2): 1 si la estación está dada de alta en el
+    # Registry, 0 si se ha dado de baja. Solo las registradas pueden autenticarse.
+    # DEFAULT 1 para que las estaciones que ya teníamos sigan funcionando igual
+    # mientras el Monitor no tenga todavía su opción de registrarse (semana 2)
+    try:
+        cursor.execute("ALTER TABLE estaciones ADD COLUMN registrada INTEGER DEFAULT 1")
+    except sqlite3.OperationalError:
+        pass   # la columna ya existía
+
     # Tabla de operarios
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS operarios (
@@ -110,10 +119,12 @@ def get_operarios():
 def autenticar_estacion(ws_id, ubicacion):
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
-    cursor.execute("SELECT id FROM estaciones WHERE id = ? AND ubicacion = ?", (ws_id, ubicacion))
+    # Además tiene que estar registrada: si se dio de baja en el Registry, no entra
+    cursor.execute("SELECT id FROM estaciones WHERE id = ? AND ubicacion = ? AND registrada = 1",
+                   (ws_id, ubicacion))
     fila = cursor.fetchone()
     conn.close()
-    # Si no hay fila, o el id no existe o la ubicación no coincide
+    # Si no hay fila, o el id no existe, o la ubicación no coincide, o está dada de baja
     return fila is not None
 
 
@@ -206,6 +217,73 @@ def get_litros_totales():
     filas = cursor.fetchall()
     conn.close()
     return {ws_id: (litros or 0.0) for ws_id, litros in filas}
+
+
+# ------------------------------------------------------------
+#  Registry: alta, consulta y baja de estaciones
+# ------------------------------------------------------------
+
+# Alta de una estación en el Registry. Devuelve:
+#   "creada"        -> no existía y se ha creado (DESCONECTADA hasta que se conecte)
+#   "reactivada"    -> existía pero estaba dada de baja; vuelve a estar registrada
+#   "ya_registrada" -> ya estaba registrada: no se toca nada
+# No se lee primero y luego se escribe, porque si llegan dos altas iguales a la
+# vez las dos verían "no existe". Se intenta directamente y se mira el resultado
+def registrar_estacion(ws_id, ubicacion):
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    # 1. Si existe dada de baja, se reactiva (con la ubicación nueva)
+    cursor.execute("UPDATE estaciones SET registrada = 1, ubicacion = ? WHERE id = ? AND registrada = 0",
+                   (ubicacion, ws_id))
+    if cursor.rowcount == 1:
+        resultado = "reactivada"
+    else:
+        # 2. Si no, se intenta crear. Si ya existe, el id es PRIMARY KEY y
+        #    SQLite da IntegrityError: entonces es que ya estaba registrada
+        try:
+            cursor.execute("INSERT INTO estaciones (id, ubicacion, estado, registrada) "
+                           "VALUES (?, ?, 'DESCONECTADA', 1)", (ws_id, ubicacion))
+            resultado = "creada"
+        except sqlite3.IntegrityError:
+            resultado = "ya_registrada"
+    conn.commit()
+    conn.close()
+    return resultado
+
+
+# Datos de registro de una estación: (id, ubicacion, registrada) o None si no existe
+def get_registro_estacion(ws_id):
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    cursor.execute("SELECT id, ubicacion, registrada FROM estaciones WHERE id = ?", (ws_id,))
+    fila = cursor.fetchone()
+    conn.close()
+    if not fila:
+        return None
+    return (fila[0], fila[1], bool(fila[2]))
+
+
+# Baja en el Registry. No borra la fila (así se conservan sus litros y su
+# historia): solo la marca como no registrada. True si se ha dado de baja,
+# False si no existía o ya estaba de baja
+def baja_estacion(ws_id):
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    cursor.execute("UPDATE estaciones SET registrada = 0 WHERE id = ? AND registrada = 1", (ws_id,))
+    hecho = cursor.rowcount == 1
+    conn.commit()
+    conn.close()
+    return hecho
+
+
+# Ids de las estaciones registradas, para el panel
+def get_registradas():
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    cursor.execute("SELECT id FROM estaciones WHERE registrada = 1")
+    ids = {fila[0] for fila in cursor.fetchall()}
+    conn.close()
+    return ids
 
 
 # True si el operario está dado de alta

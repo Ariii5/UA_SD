@@ -39,6 +39,7 @@ from prompt_toolkit.patch_stdout import patch_stdout
 from prompt_toolkit.widgets import TextArea
 from db_manager import *
 from auditoria import auditar, obtener_eventos, ultimo_seq_auditoria
+import WM_Registry
 import logging
 logging.getLogger("kafka").addHandler(logging.NullHandler())   # para que kafka-python no llene la pantalla de avisos
 
@@ -124,6 +125,29 @@ def notificar_monitor(ws_id: str, orden: str):
         except Exception as e:
             # La orden no ha llegado al monitor (seguramente se acaba de caer)
             auditar_error("notificar_monitor", e, quien=ws_id, datos={"orden": orden})
+
+# Estaciones dadas de baja en el Registry cuyo monitor estamos echando.
+# handle_monitor_client lo mira al salir para registrar el motivo correcto
+expulsados = set()
+
+
+# Echa al monitor de una estación (se llama al darla de baja en el Registry).
+# Cierra su socket: el recv de handle_monitor_client termina, y su finally
+# la marca DESCONECTADA como siempre. Si el monitor intenta volver a entrar,
+# la autenticación falla porque ya no está registrada
+def expulsar_monitor(ws_id):
+    with lock_monitores:
+        sock = monitores_conectados.get(ws_id)
+        if sock:
+            expulsados.add(ws_id)
+    if sock:
+        try:
+            sock.shutdown(socket.SHUT_RDWR)
+        except OSError:
+            pass   # ya estaba cerrado
+
+
+WM_Registry.al_dar_de_baja = expulsar_monitor
 
 TIMEOUT_MONITOR = 6     # si en 6 s no llega nada del monitor (ni un PING), la estación pasa a DESCONECTADA
 TIMEOUT_HANDSHAKE = 10  # tiempo máximo para hacer el saludo y el registro
@@ -231,9 +255,17 @@ def handle_monitor_client(client_socket, client_address):
             else:
                 client_socket.sendall(NACK)
                 print(f"[CENTRAL] Error: Estación {ws_id} no coincide en BD.")
-                auditar("AUTH_FALLIDA", f"{ws_id} rechazada: no coincide con la BD",
+                # Miramos por qué ha fallado, para que la auditoría lo diga claro
+                registro = get_registro_estacion(ws_id)
+                if registro is None:
+                    motivo, frase = "NO_EXISTE", "no existe"
+                elif not registro[2]:
+                    motivo, frase = "DADA_DE_BAJA", "está dada de baja en el Registry"
+                else:
+                    motivo, frase = "UBICACION_INCORRECTA", "la ubicación no coincide"
+                auditar("AUTH_FALLIDA", f"{ws_id} rechazada: {frase}",
                         nivel="AVISO", quien=ws_id, ip=ip,
-                        datos={"motivo": "NO_REGISTRADA", "ubicacion": ubicacion})
+                        datos={"motivo": motivo, "ubicacion": ubicacion})
                 return
         else:
             client_socket.sendall(NACK)
@@ -278,6 +310,9 @@ def handle_monitor_client(client_socket, client_address):
                 if es_el_actual:
                     monitores_conectados.pop(ws_id, None)
             if es_el_actual:
+                if ws_id in expulsados:   # la hemos echado nosotros al darla de baja
+                    expulsados.discard(ws_id)
+                    motivo_salida = "BAJA_REGISTRY"
                 actualizar_estado_estacion(ws_id, "DESCONECTADA")
                 print(f"[CENTRAL] Estación {ws_id} desconectada -> Estado: DESCONECTADA\n")
                 # Si el monitor cerró bien es INFO; si se calló o hubo un error, AVISO
@@ -1068,6 +1103,7 @@ class SalidaConRegistro:
 def estado_para_web():
     telemetria = obtener_telemetria()
     litros_totales = get_litros_totales()
+    registradas = get_registradas()
     estaciones = []
     for ws_id, ubicacion, estado in get_estaciones():
         tele = telemetria.get(ws_id, {}) if estado == "REGANDO" else {}
@@ -1077,6 +1113,7 @@ def estado_para_web():
             "volumen": round(float(tele.get("volumen") or 0.0), 2),
             "operario": tele.get("op_id") or "-",
             "litros_totales": round(float(litros_totales.get(ws_id) or 0.0), 2),
+            "registrada": ws_id in registradas,
         })
     with lock_log:
         mensajes = list(log_mensajes)[-25:]
@@ -1205,6 +1242,7 @@ PAGINA_PANEL = r"""<!doctype html>
   tr.nuevo { animation:resalta 2.5s ease-out; }
   @keyframes resalta { from { background:rgba(79,179,217,.35); } to { background:transparent; } }
   .vacio { padding:18px; text-align:center; color:var(--suave); }
+  .noreg { margin-top:6px; font-size:11px; letter-spacing:1px; color:var(--naranja); font-weight:700; }
 </style>
 </head>
 <body>
@@ -1307,6 +1345,7 @@ function pintar(datos) {
     input.oninput = () => segundos[s.id] = input.value;
     const tarjeta = el("div", {class:"ws " + clase(s.estado)}, [
       el("div", {class:"cab"}, [el("span", {class:"id", text:s.id}), el("span", {class:"ubi", text:s.ubicacion})]),
+      s.registrada ? el("span") : el("div", {class:"noreg", text:"NO REGISTRADA (dada de baja en el Registry)"}),
       el("span", {class:"estado", text:TEXTO[s.estado] || s.estado}),
       el("div", {class:"datos"}, [
         el("div", {}, [document.createTextNode("Caudal"), el("b", {text: s.caudal.toFixed(2) + " l/min"})]),
@@ -1504,6 +1543,8 @@ setInterval(refrescarEventos, 1000);
 #   GET  /api/estado   -> el estado en JSON
 #   GET  /api/eventos?desde=N -> los eventos de la auditoría con seq mayor que N
 #   POST /api/comando  -> ejecutar un botón
+#   /registry/...      -> el Registry (WM_Registry.py). Va antes de la contraseña
+#                         del panel: lo usan los monitores, no las personas
 class ManejadorPanelWeb(http.server.BaseHTTPRequestHandler):
     def log_message(self, formato, *args):
         pass   # sin esto, cada petición (una por segundo) llenaría los logs
@@ -1537,6 +1578,8 @@ class ManejadorPanelWeb(http.server.BaseHTTPRequestHandler):
         self.wfile.write(datos)
 
     def do_GET(self):
+        if WM_Registry.es_ruta_registry(self.path):
+            return WM_Registry.atender(self, "GET")
         if not self._autorizado():
             return
         if self.path in ("/", "/index.html"):
@@ -1563,6 +1606,8 @@ class ManejadorPanelWeb(http.server.BaseHTTPRequestHandler):
             self._responder(404, "text/plain; charset=utf-8", "No encontrado")
 
     def do_POST(self):
+        if WM_Registry.es_ruta_registry(self.path):
+            return WM_Registry.atender(self, "POST")
         if not self._autorizado():
             return
         if self.path != "/api/comando":
@@ -1578,12 +1623,22 @@ class ManejadorPanelWeb(http.server.BaseHTTPRequestHandler):
             self._responder(400, "application/json", json.dumps({"mensajes": [f"[ADMIN ERROR] {e}"]}))
 
 
+    # De momento solo lo usa el Registry (la baja). API_Central añadirá aquí sus DELETE
+    def do_DELETE(self):
+        if WM_Registry.es_ruta_registry(self.path):
+            return WM_Registry.atender(self, "DELETE")
+        if not self._autorizado():
+            return
+        self._responder(404, "text/plain; charset=utf-8", "No encontrado")
+
+
 # Servidor web. ThreadingHTTPServer atiende cada petición en un hilo distinto
 def iniciar_panel_web(puerto):
     servidor = http.server.ThreadingHTTPServer(("0.0.0.0", puerto), ManejadorPanelWeb)
     servidor.daemon_threads = True
     proteccion = "con contraseña" if os.environ.get("WM_PANEL_PASSWORD") else "SIN contraseña"
     print(f"[CENTRAL-WEB] Panel web en http://0.0.0.0:{puerto} ({proteccion})")
+    print(f"[REGISTRY] Registry en http://0.0.0.0:{puerto}{WM_Registry.RUTA_LISTA}")
     servidor.serve_forever()
 
 

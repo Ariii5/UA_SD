@@ -13,6 +13,7 @@ COPY db_manager.py .
 COPY WM_Central.py .
 COPY cifrado.py .
 COPY auditoria.py .
+COPY WM_Registry.py .
 
 # Puerto TCP de escucha para los monitores de estación
 EXPOSE 8000
