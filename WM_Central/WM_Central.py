@@ -9,7 +9,7 @@
 #     la estación está disponible, le manda ABRIR al engine, sigue la
 #     telemetría y al final le manda el resumen al operario
 #   - Panel en la terminal (en local) y panel web (para Railway)
-#   - Comandos de administración: regar, bloquear, activar y dar de alta
+#   - Comandos de administración: regar, parar, bloquear, activar y dar de alta
 #
 #  Uso: python3 WM_Central.py <puerto_sockets> <ip_kafka:puerto> [puerto_web]
 # ============================================================
@@ -748,6 +748,40 @@ def ordenar_cierre(ws_id, motivo="ORDEN_CENTRAL"):
     enviar(TOPIC_ORDENES, {"tipo": "CERRAR", "ws_id": ws_id, "motivo": motivo}, clave=ws_id)
 
 
+# Parar: corta el riego de una estación (o de todas con "all").
+# Solo manda CERRAR al engine; NO cambia el estado. El engine cierra la
+# válvula y manda FIN con motivo PARADA_MANUAL, y la rama FIN de
+# procesar_evento_ws pone la estación en DISPONIBLE y manda el resumen
+# al operario, igual que en un fin normal.
+# Devuelve un texto con lo que ha pasado para enseñarlo en pantalla
+def admin_parar_riego(ws_id: str):
+    # Con "all" paramos las que tienen un riego en marcha (las de activos).
+    # Copiamos las claves dentro del lock porque otro hilo puede cambiar activos
+    with lock_riegos:
+        destinos = list(activos) if ws_id.lower() == "all" else [ws_id]
+
+    paradas, rechazadas = [], []
+    for target in destinos:
+        with lock_riegos:
+            regando = target in activos
+        if not regando:
+            rechazadas.append(f"{target} ({get_estado_estacion(target) or 'no existe'})")
+            continue
+        ordenar_cierre(target, "PARADA_MANUAL")
+        paradas.append(target)
+        auditar("PARADA_MANUAL", f"Riego de {target} parado por la Central", quien="CENTRAL",
+                datos={"ws_id": target})
+
+    if ws_id.lower() == "all" and not destinos:
+        return "[ADMIN] No hay ningún riego en marcha."
+    resultado = []
+    if paradas:
+        resultado.append(f"Orden de parada enviada a: {', '.join(paradas)}.")
+    if rechazadas:
+        resultado.append(f"No se paran (no están regando): {', '.join(rechazadas)}.")
+    return "[ADMIN] " + " ".join(resultado)
+
+
 # Datos de los riegos en marcha para pintarlos en los paneles
 def obtener_telemetria():
     with lock_riegos:
@@ -790,7 +824,7 @@ def construir_panel():
     lineas.append("=================================================================================================================")
     lineas.append(f" LEYENDA: {COLOR_VERDE}● Disponible{RESET}  {COLOR_VERDE}● Regando{RESET}  {COLOR_ROJO}● Averiada/Fuga{RESET}  {COLOR_NARANJA}● Fuera de Servicio{RESET}  {COLOR_GRIS}● Desconectada{RESET}")
     lineas.append("=================================================================================================================")
-    lineas.append(" COMANDOS: regar <ID|all> <seg>  |  bloquear <ID|all>  |  activar <ID|all>")
+    lineas.append(" COMANDOS: regar <ID|all> <seg>  |  parar <ID|all>  |  bloquear <ID|all>  |  activar <ID|all>")
     lineas.append("           alta-ws <ID> <ubicación>  |  alta-fo <ID> <nombre>")
     return "\n".join(lineas)
 
@@ -844,6 +878,8 @@ def ejecutar_comando_admin(command: str, publicar_mensaje):
             publicar_mensaje(admin_bloquear_estacion(partes[1].upper()))
         elif accion == "activar" and len(partes) == 2:
             publicar_mensaje(admin_activar_estacion(partes[1].upper()))
+        elif accion == "parar" and len(partes) == 2:
+            publicar_mensaje(admin_parar_riego(partes[1].upper()))
         elif accion == "alta-ws" and len(partes) >= 3:
             # La ubicación puede tener espacios ("Parque Norte"), por eso juntamos el resto
             publicar_mensaje(admin_alta_estacion(partes[1], " ".join(partes[2:])))
@@ -852,7 +888,7 @@ def ejecutar_comando_admin(command: str, publicar_mensaje):
         else:
             publicar_mensaje(
                 "[ADMIN] Uso: regar <WS_ID|all> <segundos>, "
-                "bloquear <WS_ID|all>, activar <WS_ID|all>, "
+                "bloquear <WS_ID|all>, activar <WS_ID|all>, parar <WS_ID|all>, "
                 "alta-ws <WS_ID> <ubicación>, alta-fo <FO_ID> <nombre>"
             )
     except Exception as exc:
@@ -1012,7 +1048,7 @@ def ejecutar_comando_web(datos):
         print(f"[WEB] {respuesta}")
         return [respuesta]
     ws_id = str(datos.get("ws_id", "")).strip().upper() or "ALL"
-    if accion not in ("regar", "bloquear", "activar"):
+    if accion not in ("regar", "bloquear", "activar", "parar"):
         return ["[ADMIN] Acción no válida."]
     if ws_id != "ALL" and get_estado_estacion(ws_id) is None:
         return [f"[ADMIN] La estación {ws_id} no existe."]
@@ -1070,7 +1106,7 @@ PAGINA_PANEL = r"""<!doctype html>
   button { cursor:pointer; border:1px solid var(--borde); background:#16303d; color:var(--texto);
            border-radius:7px; padding:6px 10px; font-size:13px; }
   button:hover { border-color:var(--acento); } button:disabled { opacity:.4; cursor:not-allowed; }
-  button.regar { border-color:#246b48; } button.bloquear { border-color:#7a4d1d; } button.activar { border-color:#246b48; }
+  button.regar { border-color:#246b48; } button.bloquear { border-color:#7a4d1d; } button.activar { border-color:#246b48; } button.parar { border-color:#2b5d7a; }
   input[type=text] { background:#0b1418; color:var(--texto); border:1px solid var(--borde);
                      border-radius:7px; padding:6px; font-size:13px; max-width:100%; }
   input[type=number] { width:62px; background:#0b1418; color:var(--texto); border:1px solid var(--borde);
@@ -1107,6 +1143,7 @@ PAGINA_PANEL = r"""<!doctype html>
       <button class="regar" onclick="orden('regar','ALL','seg-all')">💧 Regar todas</button>
       <button class="bloquear" onclick="orden('bloquear','ALL')">⛔ Bloquear todas</button>
       <button class="activar" onclick="orden('activar','ALL')">✅ Activar todas</button>
+      <button class="parar" onclick="orden('parar','ALL')">⏹ Parar todas</button>
     </div>
     <div id="respuesta"></div>
     <div class="estaciones" id="estaciones"></div>
@@ -1182,6 +1219,7 @@ function pintar(datos) {
         el("button", {class:"regar", onclick: () => orden("regar", s.id, idSeg)}, [document.createTextNode("💧 Regar")]),
         el("button", {class:"bloquear", onclick: () => orden("bloquear", s.id)}, [document.createTextNode("⛔ Bloquear")]),
         el("button", {class:"activar", onclick: () => orden("activar", s.id)}, [document.createTextNode("✅ Activar")]),
+        el("button", {class:"parar", onclick: () => orden("parar", s.id)}, [document.createTextNode("⏹ Parar")]),
       ]),
     ]);
     cont.appendChild(tarjeta);
