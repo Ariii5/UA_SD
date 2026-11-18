@@ -102,4 +102,11 @@ def obtener_eventos(desde=0):
         return [e for e in eventos if e["seq"] > desde]
 
 
+
+# El último seq que se ha dado (0 si todavía no hay ninguno)
+def ultimo_seq_auditoria():
+    with lock_auditoria:
+        return ultimo_seq
+
+
 _cargar_fichero()

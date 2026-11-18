@@ -197,6 +197,17 @@ def alta_operario(op_id, nombre):
     return resultado
 
 
+# Litros regados en total por cada estación: {"WS-01": 23.5, ...}
+# Va aparte de get_estaciones() para no cambiar sus 3 campos, que se usan en muchos sitios
+def get_litros_totales():
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    cursor.execute("SELECT id, litros_totales FROM estaciones")
+    filas = cursor.fetchall()
+    conn.close()
+    return {ws_id: (litros or 0.0) for ws_id, litros in filas}
+
+
 # True si el operario está dado de alta
 def existe_operario(op_id):
     conn = sqlite3.connect(DB_PATH)

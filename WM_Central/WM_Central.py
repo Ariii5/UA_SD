@@ -26,6 +26,7 @@ import hmac
 import base64
 import collections
 import http.server
+import urllib.parse
 from kafka import KafkaProducer, KafkaConsumer
 from kafka.errors import NoBrokersAvailable
 from prompt_toolkit.application import Application
@@ -37,7 +38,7 @@ from prompt_toolkit.layout.dimension import Dimension
 from prompt_toolkit.patch_stdout import patch_stdout
 from prompt_toolkit.widgets import TextArea
 from db_manager import *
-from auditoria import auditar, obtener_eventos
+from auditoria import auditar, obtener_eventos, ultimo_seq_auditoria
 import logging
 logging.getLogger("kafka").addHandler(logging.NullHandler())   # para que kafka-python no llene la pantalla de avisos
 
@@ -1019,6 +1020,7 @@ class SalidaConRegistro:
 # Lo que devuelve /api/estado: estaciones con su telemetría y los últimos mensajes
 def estado_para_web():
     telemetria = obtener_telemetria()
+    litros_totales = get_litros_totales()
     estaciones = []
     for ws_id, ubicacion, estado in get_estaciones():
         tele = telemetria.get(ws_id, {}) if estado == "REGANDO" else {}
@@ -1027,6 +1029,7 @@ def estado_para_web():
             "caudal": round(float(tele.get("caudal") or 0.0), 2),
             "volumen": round(float(tele.get("volumen") or 0.0), 2),
             "operario": tele.get("op_id") or "-",
+            "litros_totales": round(float(litros_totales.get(ws_id) or 0.0), 2),
         })
     with lock_log:
         mensajes = list(log_mensajes)[-25:]
@@ -1100,7 +1103,7 @@ PAGINA_PANEL = r"""<!doctype html>
   .ws .id { font-weight:700; font-size:16px; } .ws .ubi { color:var(--suave); font-size:13px; }
   .estado { display:inline-block; margin:8px 0; padding:3px 10px; border-radius:6px; font-weight:700;
             font-size:12px; letter-spacing:1px; color:#0b1418; background:var(--gris); }
-  .datos { display:grid; grid-template-columns:repeat(3,1fr); gap:6px; font-size:12px; color:var(--suave); }
+  .datos { display:grid; grid-template-columns:repeat(2,1fr); gap:6px; font-size:12px; color:var(--suave); }
   .datos b { display:block; color:var(--texto); font-size:15px; }
   .acciones { display:flex; flex-wrap:wrap; gap:6px; margin-top:10px; align-items:center; }
   button { cursor:pointer; border:1px solid var(--borde); background:#16303d; color:var(--texto);
@@ -1126,6 +1129,35 @@ PAGINA_PANEL = r"""<!doctype html>
   #respuesta { min-height:20px; font-size:13px; color:#9fd3ea; margin-bottom:10px; }
   footer { padding:0 22px 18px; color:var(--suave); font-size:12px; }
   .desconexion { color:var(--rojo) !important; font-weight:700; }
+
+  /* ---- Registro de eventos (auditoría) ---- */
+  #caja-eventos { margin:0 22px 18px; }
+  .filtros { display:flex; flex-wrap:wrap; gap:8px; align-items:center; margin-bottom:10px; font-size:13px; }
+  .filtros select, .filtros input { background:#0b1418; color:var(--texto); border:1px solid var(--borde);
+                                    border-radius:7px; padding:6px; font-size:13px; }
+  .filtros .hueco { flex:1; }
+  .contador { color:var(--suave); font-size:13px; }
+  .contador b { color:var(--texto); }
+  button.pausado { border-color:var(--naranja); color:var(--naranja); }
+  .tabla-eventos { max-height:420px; overflow-y:auto; border:1px solid var(--borde); border-radius:8px; }
+  .tabla-eventos table { width:100%; border-collapse:collapse; font-size:13px; }
+  .tabla-eventos th { position:sticky; top:0; background:#0e1b23; color:var(--suave); font-weight:600;
+                      text-align:left; padding:7px 8px; font-size:11px; letter-spacing:1px; z-index:1; }
+  .tabla-eventos td { padding:6px 8px; border-top:1px solid #15262f; vertical-align:top; }
+  .tabla-eventos tr.fila { cursor:pointer; } .tabla-eventos tr.fila:hover { background:#14262f; }
+  .tabla-eventos .seq, .tabla-eventos .hora, .tabla-eventos .ip { font-family:ui-monospace,Menlo,Consolas,monospace;
+                                                                   color:var(--suave); white-space:nowrap; }
+  .tabla-eventos .quien { font-weight:600; white-space:nowrap; }
+  .nivel { display:inline-block; padding:1px 8px; border-radius:5px; font-size:11px; font-weight:700;
+           letter-spacing:1px; color:#0b1418; }
+  .n-INFO { background:var(--acento); } .n-AVISO { background:var(--naranja); } .n-ERROR { background:var(--rojo); }
+  tr.e-AVISO { background:rgba(243,156,53,.06); } tr.e-ERROR { background:rgba(239,83,80,.10); }
+  .tipo { font-family:ui-monospace,Menlo,Consolas,monospace; font-size:12px; white-space:nowrap; }
+  tr.detalle td { background:#0b1418; color:var(--suave); font-family:ui-monospace,Menlo,Consolas,monospace;
+                  font-size:12px; white-space:pre-wrap; }
+  tr.nuevo { animation:resalta 2.5s ease-out; }
+  @keyframes resalta { from { background:rgba(79,179,217,.35); } to { background:transparent; } }
+  .vacio { padding:18px; text-align:center; color:var(--suave); }
 </style>
 </head>
 <body>
@@ -1166,6 +1198,26 @@ PAGINA_PANEL = r"""<!doctype html>
     <div id="mensajes"></div>
   </aside>
 </main>
+<section class="caja" id="caja-eventos">
+  <h2>REGISTRO DE EVENTOS (AUDITORÍA)</h2>
+  <div class="filtros">
+    <select id="f-nivel" onchange="pintarEventos()">
+      <option value="">Todos los niveles</option><option>INFO</option><option>AVISO</option><option>ERROR</option>
+    </select>
+    <select id="f-quien" onchange="pintarEventos()"><option value="">Todos (quién)</option></select>
+    <select id="f-tipo" onchange="pintarEventos()"><option value="">Todos los tipos</option></select>
+    <input type="text" id="f-texto" placeholder="Buscar en el texto…" oninput="pintarEventos()" size="22">
+    <span class="hueco"></span>
+    <span class="contador" id="contador-eventos"></span>
+    <button id="btn-pausa" onclick="alternarPausa()">⏸ Pausar</button>
+  </div>
+  <div class="tabla-eventos">
+    <table>
+      <thead><tr><th>#</th><th>HORA</th><th>NIVEL</th><th>TIPO</th><th>QUIÉN</th><th>IP</th><th>QUÉ HA PASADO</th></tr></thead>
+      <tbody id="eventos"></tbody>
+    </table>
+  </div>
+</section>
 <footer id="pie">Conectando con Central…</footer>
 <script>
 const COLORES = {DISPONIBLE:"var(--verde)", REGANDO:"var(--verde)", AVERIADA:"var(--rojo)",
@@ -1213,6 +1265,7 @@ function pintar(datos) {
         el("div", {}, [document.createTextNode("Caudal"), el("b", {text: s.caudal.toFixed(2) + " l/min"})]),
         el("div", {}, [document.createTextNode("Volumen"), el("b", {text: s.volumen.toFixed(2) + " l"})]),
         el("div", {}, [document.createTextNode("Operario"), el("b", {text: s.operario})]),
+        el("div", {}, [document.createTextNode("Total regado"), el("b", {text: s.litros_totales.toFixed(2) + " l"})]),
       ]),
       el("div", {class:"acciones"}, [
         input,
@@ -1287,8 +1340,112 @@ async function alta(accion, idCampo, idTexto) {
   refrescar();
 }
 
+// ------------------------------------------------------------
+//  REGISTRO DE EVENTOS
+//  Cada segundo pide a /api/eventos solo los eventos nuevos (los que
+//  tienen seq mayor que el último que tenemos) y los guarda aquí.
+//  Con "Pausar" se siguen recibiendo pero no se pinta la tabla, para
+//  poder leer tranquilamente; al reanudar aparecen todos de golpe.
+// ------------------------------------------------------------
+const eventos = [];            // todos los recibidos, del más viejo al más nuevo (máximo 500)
+let ultimoSeq = 0;             // seq del último evento recibido
+let pausado = false;
+let sinVer = 0;                // eventos que han llegado mientras estaba en pausa
+const recienLlegados = new Set();   // seq de los que hay que resaltar al pintarlos
+const abiertos = new Set();         // seq de las filas con el detalle desplegado
+
+async function refrescarEventos() {
+  try {
+    const r = await fetch(`/api/eventos?desde=${ultimoSeq}`, {cache:"no-store"});
+    if (!r.ok) return;
+    const datos = await r.json();
+    // Si el último seq de la Central es menor que el nuestro, es que se ha
+    // borrado el log: empezamos de cero
+    if (datos.ultimo < ultimoSeq) { eventos.length = 0; ultimoSeq = 0; return; }
+    if (!datos.eventos.length) return;
+    datos.eventos.forEach(e => { eventos.push(e); recienLlegados.add(e.seq); });
+    ultimoSeq = datos.eventos[datos.eventos.length - 1].seq;
+    while (eventos.length > 500) eventos.shift();
+    if (pausado) { sinVer += datos.eventos.length; botonPausa(); }
+    else pintarEventos();
+  } catch (e) { /* sin conexión: ya lo avisa el pie de página */ }
+}
+
+function alternarPausa() {
+  pausado = !pausado;
+  sinVer = 0;
+  botonPausa();
+  if (!pausado) pintarEventos();
+}
+
+function botonPausa() {
+  const b = document.getElementById("btn-pausa");
+  b.className = pausado ? "pausado" : "";
+  b.textContent = pausado ? `▶ Reanudar${sinVer ? ` (${sinVer} nuevos)` : ""}` : "⏸ Pausar";
+}
+
+// Rellena un desplegable con los valores que van apareciendo, sin perder lo elegido
+function rellenarFiltro(id, valores, textoTodos) {
+  const sel = document.getElementById(id);
+  const elegido = sel.value;
+  const lista = [...new Set(valores)].sort();
+  if (sel.options.length - 1 === lista.length) return;   // no ha cambiado nada
+  sel.replaceChildren(el("option", {value:"", text:textoTodos}));
+  lista.forEach(v => sel.appendChild(el("option", {value:v, text:v})));
+  sel.value = elegido;
+}
+
+function pintarEventos() {
+  rellenarFiltro("f-quien", eventos.map(e => e.quien), "Todos (quién)");
+  rellenarFiltro("f-tipo", eventos.map(e => e.tipo), "Todos los tipos");
+  const nivel = document.getElementById("f-nivel").value;
+  const quien = document.getElementById("f-quien").value;
+  const tipo = document.getElementById("f-tipo").value;
+  const texto = document.getElementById("f-texto").value.toLowerCase();
+
+  const visibles = eventos.filter(e =>
+    (!nivel || e.nivel === nivel) && (!quien || e.quien === quien) && (!tipo || e.tipo === tipo) &&
+    (!texto || e.texto.toLowerCase().includes(texto)));
+
+  const avisos = eventos.filter(e => e.nivel === "AVISO").length;
+  const errores = eventos.filter(e => e.nivel === "ERROR").length;
+  document.getElementById("contador-eventos").replaceChildren(
+    el("b", {text: visibles.length}), document.createTextNode(` de ${eventos.length} eventos · `),
+    el("b", {text: avisos}), document.createTextNode(" avisos · "),
+    el("b", {text: errores}), document.createTextNode(" errores"));
+
+  const cuerpo = document.getElementById("eventos");
+  cuerpo.replaceChildren();
+  if (!visibles.length) {
+    cuerpo.appendChild(el("tr", {}, [el("td", {colspan:"7", class:"vacio",
+      text: eventos.length ? "Ningún evento coincide con los filtros." : "Todavía no hay eventos."})]));
+  }
+  // Los más recientes arriba
+  visibles.slice().reverse().forEach(e => {
+    const fila = el("tr", {class:`fila e-${e.nivel}` + (recienLlegados.has(e.seq) ? " nuevo" : ""),
+                           title:"Pulsa para ver los detalles"}, [
+      el("td", {class:"seq", text:e.seq}),
+      el("td", {class:"hora", text:(e.fecha || "").slice(11, 19), title:e.fecha}),
+      el("td", {}, [el("span", {class:`nivel n-${e.nivel}`, text:e.nivel})]),
+      el("td", {class:"tipo", text:e.tipo}),
+      el("td", {class:"quien", text:e.quien}),
+      el("td", {class:"ip", text:e.ip}),
+      el("td", {text:e.texto}),
+    ]);
+    fila.onclick = () => { abiertos.has(e.seq) ? abiertos.delete(e.seq) : abiertos.add(e.seq); pintarEventos(); };
+    cuerpo.appendChild(fila);
+    if (abiertos.has(e.seq)) {
+      cuerpo.appendChild(el("tr", {class:"detalle"}, [el("td", {colspan:"7",
+        text:`Fecha: ${e.fecha}\nDatos: ${JSON.stringify(e.datos, null, 2)}`})]));
+    }
+  });
+  recienLlegados.clear();
+}
+
 refrescar();
+refrescarEventos();
 setInterval(refrescar, 1000);
+setInterval(refrescarEventos, 1000);
 </script>
 </body>
 </html>
@@ -1298,6 +1455,7 @@ setInterval(refrescar, 1000);
 # Atiende las peticiones del navegador:
 #   GET  /             -> la página
 #   GET  /api/estado   -> el estado en JSON
+#   GET  /api/eventos?desde=N -> los eventos de la auditoría con seq mayor que N
 #   POST /api/comando  -> ejecutar un botón
 class ManejadorPanelWeb(http.server.BaseHTTPRequestHandler):
     def log_message(self, formato, *args):
@@ -1341,6 +1499,19 @@ class ManejadorPanelWeb(http.server.BaseHTTPRequestHandler):
             self.end_headers()
         elif self.path.startswith("/api/estado"):
             self._responder(200, "application/json", json.dumps(estado_para_web()))
+        elif self.path.startswith("/api/eventos"):
+            # urlparse separa la ruta de lo que va detrás de "?" y parse_qs lo
+            # convierte en diccionario: "desde=12" -> {"desde": ["12"]}
+            consulta = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+            try:
+                desde = int(consulta.get("desde", ["0"])[0])
+            except ValueError:
+                desde = 0
+            lista = obtener_eventos(desde)
+            # "ultimo" sirve a la página para darse cuenta si se ha borrado el log
+            ultimo = lista[-1]["seq"] if lista else ultimo_seq_auditoria()
+            self._responder(200, "application/json", json.dumps({"eventos": lista, "ultimo": ultimo},
+                                                                 ensure_ascii=False, default=str))
         else:
             self._responder(404, "text/plain; charset=utf-8", "No encontrado")
 
