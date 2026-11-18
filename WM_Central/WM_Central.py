@@ -531,6 +531,18 @@ def vigilar_timeouts():
                 if get_estado_estacion(ws) == "REGANDO":
                     actualizar_estado_estacion(ws, "DISPONIBLE")
                 print(f"[CENTRAL-RIEGO] {ws}: sin noticias del riego en {TIMEOUT_SIN_NOTICIAS}s. Se da por terminado.")
+                # No llegará el FIN, así que hacemos aquí lo que haría la rama FIN de
+                # procesar_evento_ws: sumar los litros que llevaba (la última telemetría)
+                # y registrar el RIEGO_FIN. Es AVISO porque el riego se ha perdido
+                litros = round(float(a["volumen"] or 0.0), 2)
+                segundos = round(float(a["transcurrido"] or 0.0), 1)
+                sumar_litros(ws, litros)
+                auditar("RIEGO_FIN", f"Riego terminado en {ws} (SIN_NOTICIAS_ESTACION). {litros} litros en {segundos} s",
+                        nivel="AVISO", quien=ws,
+                        datos={"op_id": a["op_id"], "ip_operario": a["sol"].get("ip", "-"),
+                               "req_id": a["req_id"], "motivo": "SIN_NOTICIAS_ESTACION",
+                               "litros": litros, "duracion": segundos,
+                               "estado_nuevo": get_estado_estacion(ws)})
                 responder_operario("RESUMEN", a["sol"], f"Sin noticias de {ws}: riego dado por terminado",
                                    motivo="SIN_NOTICIAS_ESTACION",
                                    duracion=a["transcurrido"], litros=a["volumen"])
