@@ -37,6 +37,7 @@ from prompt_toolkit.layout.dimension import Dimension
 from prompt_toolkit.patch_stdout import patch_stdout
 from prompt_toolkit.widgets import TextArea
 from db_manager import *
+from auditoria import auditar, obtener_eventos
 import logging
 logging.getLogger("kafka").addHandler(logging.NullHandler())   # para que kafka-python no llene la pantalla de avisos
 
@@ -100,16 +101,20 @@ TIMEOUT_MONITOR = 6     # si en 6 s no llega nada del monitor (ni un PING), la e
 TIMEOUT_HANDSHAKE = 10  # tiempo máximo para hacer el saludo y el registro
 
 
-# Qué hacer con cada trama que nos manda un monitor ya registrado
-def procesar_trama_monitor(ws_id, texto):
+# Qué hacer con cada trama que nos manda un monitor ya registrado.
+# ip es la del monitor, para la auditoría
+def procesar_trama_monitor(ws_id, texto, ip="-"):
     if texto == "PING":
         return   # solo sirve para saber que el monitor sigue vivo
 
     if texto == "ALERT#FUGA":
         if get_estado_estacion(ws_id) == "FUERA DE SERVICIO":
             bloqueadas_con_averia.add(ws_id)   # nos acordamos de que estaba bloqueada
+        estado_antes = get_estado_estacion(ws_id)
         actualizar_estado_estacion(ws_id, "AVERIADA")
         print(f"\n[ALERTA CRÍTICA] ¡Avería/Fuga detectada en {ws_id}! -> Estado en BD: AVERIADA\n")
+        auditar("FUGA", f"Fuga detectada en {ws_id}", nivel="ERROR", quien=ws_id, ip=ip,
+                datos={"estado_anterior": estado_antes, "estado_nuevo": "AVERIADA"})
 
     elif texto == "ALERT#RESUELTA":
         estado = get_estado_estacion(ws_id)
@@ -122,6 +127,8 @@ def procesar_trama_monitor(ws_id, texto):
                 nuevo = "DISPONIBLE"
             actualizar_estado_estacion(ws_id, nuevo)
             print(f"\n[CENTRAL] Avería resuelta en {ws_id} -> Estado en BD: {nuevo}\n")
+            auditar("FUGA_RESUELTA", f"Fuga resuelta en {ws_id}", quien=ws_id, ip=ip,
+                    datos={"estado_anterior": "AVERIADA", "estado_nuevo": nuevo})
         else:
             print(f"[CENTRAL] {ws_id} avisa de avería resuelta, pero está en {estado}: no se cambia.")
 
@@ -136,6 +143,8 @@ def procesar_trama_monitor(ws_id, texto):
 #   3. Escucha: recibimos sus PING y sus avisos hasta que se desconecte
 def handle_monitor_client(client_socket, client_address):
     ws_id = None
+    ip = client_address[0]           # IP del monitor, para la auditoría
+    motivo_salida = "ERROR"          # por qué se va el monitor (se cambia abajo si es por otra cosa)
     print(f"\n[CENTRAL] Conexión TCP entrante desde {client_address}")   # client_address = (IP, puerto)
     try:
         # Si en 10 s no completa el saludo y el registro, cerramos: una
@@ -147,6 +156,9 @@ def handle_monitor_client(client_socket, client_address):
         if data != ENQ:
             print(f"[CENTRAL] Byte recibido incorrecto ({data}). Enviando <NACK>...")
             client_socket.sendall(NACK)
+            auditar("AUTH_FALLIDA", f"Conexión desde {ip} rechazada: saludo incorrecto",
+                    nivel="AVISO", quien="DESCONOCIDO", ip=ip,
+                    datos={"motivo": "HANDSHAKE", "recibido": repr(data)})
             return
 
         client_socket.sendall(ACK)
@@ -171,16 +183,27 @@ def handle_monitor_client(client_socket, client_address):
                     # desconectado y el nuevo podrá entrar en su siguiente intento
                     client_socket.sendall(NACK)
                     print(f"[CENTRAL] Rechazado: ya hay un Monitor conectado como {ws_id}.")
+                    auditar("AUTH_FALLIDA", f"{ws_id} rechazada: ya hay un monitor conectado con ese ID",
+                            nivel="AVISO", quien=ws_id, ip=ip,
+                            datos={"motivo": "DUPLICADO", "ubicacion": ubicacion})
                     return
                 actualizar_estado_estacion(ws_id, "DISPONIBLE")
                 client_socket.sendall(ACK)
                 print(f"[CENTRAL] Estación {ws_id} ({ubicacion}) autenticada con éxito -> Estado: DISPONIBLE")
+                auditar("AUTH_OK", f"{ws_id} autenticada", quien=ws_id, ip=ip,
+                        datos={"ubicacion": ubicacion})
             else:
                 client_socket.sendall(NACK)
                 print(f"[CENTRAL] Error: Estación {ws_id} no coincide en BD.")
+                auditar("AUTH_FALLIDA", f"{ws_id} rechazada: no coincide con la BD",
+                        nivel="AVISO", quien=ws_id, ip=ip,
+                        datos={"motivo": "NO_REGISTRADA", "ubicacion": ubicacion})
                 return
         else:
             client_socket.sendall(NACK)
+            auditar("AUTH_FALLIDA", f"Conexión desde {ip} rechazada: registro mal formado",
+                    nivel="AVISO", quien="DESCONOCIDO", ip=ip,
+                    datos={"motivo": "FORMATO", "recibido": reg_data[:100]})
             return
 
         # --- 3. Escucha ---
@@ -193,8 +216,10 @@ def handle_monitor_client(client_socket, client_address):
                 msg = client_socket.recv(1024)
             except socket.timeout:
                 print(f"\n[CENTRAL] {ws_id} no da señales de vida en {TIMEOUT_MONITOR}s. Se da por desconectada.")
+                motivo_salida = "TIMEOUT"
                 break
             if not msg:
+                motivo_salida = "CERRADA"
                 break   # el monitor ha cerrado la conexión
 
             buffer += msg.decode('utf-8', 'replace')
@@ -202,7 +227,7 @@ def handle_monitor_client(client_socket, client_address):
             # medias, así que vamos sacando del buffer las que estén completas
             while "\n" in buffer:
                 texto, buffer = buffer.split("\n", 1)
-                procesar_trama_monitor(ws_id, texto.strip())
+                procesar_trama_monitor(ws_id, texto.strip(), ip)
 
     except Exception as e:
         print(f"[CENTRAL] Incidencia con {ws_id or client_address}: {e}")
@@ -218,6 +243,10 @@ def handle_monitor_client(client_socket, client_address):
             if es_el_actual:
                 actualizar_estado_estacion(ws_id, "DESCONECTADA")
                 print(f"[CENTRAL] Estación {ws_id} desconectada -> Estado: DESCONECTADA\n")
+                # Si el monitor cerró bien es INFO; si se calló o hubo un error, AVISO
+                auditar("MONITOR_DESCONECTADO", f"Monitor de {ws_id} desconectado ({motivo_salida})",
+                        nivel="INFO" if motivo_salida == "CERRADA" else "AVISO",
+                        quien=ws_id, ip=ip, datos={"motivo": motivo_salida})
         client_socket.close()
 
 
@@ -279,6 +308,9 @@ def responder_operario(tipo, sol, mensaje, **extra):
 
 def denegar(sol, motivo):
     print(f"[CENTRAL-RIEGO] DENEGADO {sol.get('op_id')} -> {sol.get('ws_id')}: {motivo}")
+    auditar("RIEGO_DENEGADO", f"Riego denegado a {sol.get('op_id')} en {sol.get('ws_id')}: {motivo}",
+            nivel="AVISO", quien=sol.get("op_id"), ip=sol.get("ip", "-"),
+            datos={"ws_id": sol.get("ws_id"), "req_id": sol.get("req_id"), "motivo": motivo})
     responder_operario("DENEGADO", sol, motivo)
 
 
@@ -288,6 +320,10 @@ def procesar_solicitud(sol):
     op_id = sol.get("op_id")
     ws_id = sol.get("ws_id")
     print(f"[CENTRAL-RIEGO] Petición de {op_id}: regar {ws_id} durante {sol.get('duracion')}s")
+    # La IP la manda el FO en el mensaje; los riegos de Central y los manuales no la llevan
+    auditar("RIEGO_SOLICITADO", f"{op_id} pide regar {ws_id} durante {sol.get('duracion')}s",
+            quien=op_id, ip=sol.get("ip", "-"),
+            datos={"ws_id": ws_id, "req_id": sol.get("req_id"), "duracion": sol.get("duracion")})
     responder_operario("INFO", sol, f"CENTRAL ha recibido la petición. Comprobando {ws_id}...")
 
     # El operario tiene que estar dado de alta (salvo los riegos de Central y los manuales)
@@ -337,6 +373,10 @@ def procesar_evento_ws(ev):
                               "ultimo": time.time(), "sol": pend["sol"]}
         actualizar_estado_estacion(ws_id, "REGANDO")
         print(f"[CENTRAL-RIEGO] {ws_id} REGANDO para {ev.get('op_id')}")
+        auditar("RIEGO_INICIO", f"Riego iniciado en {ws_id} para {ev.get('op_id')}",
+                quien=ws_id,   # la IP del engine no la sabemos (llega por Kafka); la del operario va en datos
+                datos={"op_id": ev.get("op_id"), "ip_operario": pend["sol"].get("ip", "-"),
+                       "req_id": ev.get("req_id"), "duracion": pend["sol"].get("duracion")})
         responder_operario("AUTORIZADO", pend["sol"],
                            f"Riego AUTORIZADO. {ws_id} ha abierto la electroválvula.")
 
@@ -407,6 +447,18 @@ def procesar_evento_ws(ev):
 
         print(f"[CENTRAL-RIEGO] {ws_id} FIN de riego ({motivo}): "
               f"{ev.get('duracion')}s, {ev.get('litros')} l")
+        # Si acabó por fuga o porque se cayó el monitor es AVISO; si no, INFO
+        try:
+            litros = round(float(ev.get("litros")), 2)
+        except (TypeError, ValueError):
+            litros = ev.get("litros")
+        auditar("RIEGO_FIN", f"Riego terminado en {ws_id} ({motivo}). {litros} litros en {ev.get('duracion')} s",
+                nivel="AVISO" if motivo in ("FUGA", "MONITOR_CAIDO") else "INFO",
+                quien=ws_id,
+                datos={"op_id": ev.get("op_id"), "ip_operario": act["sol"].get("ip", "-") if act else "-",
+                       "req_id": ev.get("req_id"), "motivo": motivo,
+                       "litros": litros, "duracion": ev.get("duracion"),
+                       "estado_nuevo": get_estado_estacion(ws_id)})
         sol = act["sol"] if act else {"op_id": ev.get("op_id"), "req_id": ev.get("req_id"),
                                       "ws_id": ws_id}
         responder_operario("RESUMEN", sol, f"Riego finalizado en {ws_id}. Motivo: {motivo}",
@@ -626,11 +678,17 @@ def admin_bloquear_estacion(ws_id: str):
             actualizar_estado_estacion(target, "FUERA DE SERVICIO")
             notificar_monitor(target, "ORDEN#BLOQUEAR")
             bloqueadas.append(target)
+            auditar("BLOQUEO", f"{target} bloqueada por la Central", nivel="AVISO", quien="CENTRAL",
+                    datos={"ws_id": target, "estado_anterior": estado, "estado_nuevo": "FUERA DE SERVICIO",
+                           "riego_cortado": estado == "REGANDO" or riego_activo})
 
         elif estado == "AVERIADA":
             bloqueadas_con_averia.add(target)
             notificar_monitor(target, "ORDEN#BLOQUEAR")
             en_averia.append(target)
+            auditar("BLOQUEO", f"{target} bloqueada por la Central (sigue averiada; quedará FUERA DE SERVICIO al repararse)",
+                    nivel="AVISO", quien="CENTRAL",
+                    datos={"ws_id": target, "estado_anterior": estado, "estado_nuevo": "AVERIADA"})
 
         else:
             rechazadas.append(f"{target} ({estado or 'no existe'})")
@@ -662,6 +720,8 @@ def admin_activar_estacion(ws_id: str):
         actualizar_estado_estacion(target, "DISPONIBLE")
         notificar_monitor(target, "ORDEN#ACTIVAR")
         activadas.append(target)
+        auditar("ACTIVACION", f"{target} activada por la Central", quien="CENTRAL",
+                datos={"ws_id": target, "estado_anterior": estado, "estado_nuevo": "DISPONIBLE"})
 
     resultado = []
     if activadas:
@@ -1281,6 +1341,8 @@ if __name__ == "__main__":
 
     # Base de datos: todas las estaciones empiezan DESCONECTADAS
     init_db()
+    auditar("ARRANQUE", "Central arrancada",
+            datos={"puerto_sockets": socket_port, "kafka": kafka_server, "puerto_web": web_port})
     print("\n--- Estado inicial de estaciones (BD) ---")
     for est in get_estaciones():
         print(f"[{est[2]}] ID: {est[0]} | Zona: {est[1]}")

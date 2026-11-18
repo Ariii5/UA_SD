@@ -12,6 +12,7 @@ RUN pip install --no-cache-dir kafka-python==2.2.15 prompt_toolkit cryptography
 COPY db_manager.py .
 COPY WM_Central.py .
 COPY cifrado.py .
+COPY auditoria.py .
 
 # Puerto TCP de escucha para los monitores de estación
 EXPOSE 8000

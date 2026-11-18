@@ -10,3 +10,6 @@ __pycache__/
 
 #Estado de riego activo
 datos/
+
+# Log de auditoría de Central (se genera solo)
+auditoria.log
