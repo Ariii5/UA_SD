@@ -4,7 +4,9 @@
 #  El monitor hace dos cosas a la vez, cada una en su hilo:
 #   1. CLIENTE de Central: se registra (ENQ/ACK + REG#id#ubicacion), le manda
 #      un PING cada 2 s para que sepa que seguimos vivos y le avisa de las
-#      averías (ALERT#FUGA) y de cuando se arreglan (ALERT#RESUELTA).
+#      averías y de cuando se arreglan (ALERT#RESUELTA). Hay dos averías:
+#      ALERT#FUGA (el engine contesta KO) y ALERT#ENGINE_CAIDO (el engine no
+#      contesta o se desconecta).
 #   2. SERVIDOR para su engine: el engine se conecta a nosotros y cada
 #      segundo le preguntamos HEALTH?. Si contesta KO o no contesta, es avería.
 #
@@ -26,6 +28,7 @@ sock_central_global = None
 
 TIMEOUT_PULSO = 3           # segundos que esperamos la respuesta del engine
 estacion_averiada = False   # True desde que avisamos de una avería hasta que se arregla
+alerta_averia = None        # qué avería mandamos (ALERT#FUGA o ALERT#ENGINE_CAIDO), para repetirla al reconectar
 LATIDO_CENTRAL = 2          # cada cuántos segundos mandamos PING a Central
 lock_envio_central = threading.Lock()   # para que dos hilos no escriban a la vez en el socket
 
@@ -64,15 +67,19 @@ def enviar_latidos():
                 pass
 
 
-#Avisa de la avería a Central solo la primera vez (para no mandar
-#ALERT#FUGA cada segundo mientras dure)
-def reportar_averia(ws_id, motivo):
-    global estacion_averiada
+#Avisa de la avería a Central solo la primera vez (para no mandar la
+#alerta cada segundo mientras dure).
+#  motivo -> la frase que se enseña en la pantalla del monitor
+#  alerta -> la trama que se manda a Central: "ALERT#FUGA" si el engine
+#            contesta KO, "ALERT#ENGINE_CAIDO" si no contesta o se desconecta
+def reportar_averia(ws_id, motivo, alerta):
+    global estacion_averiada, alerta_averia
     if estacion_averiada:
         return
     estacion_averiada = True
+    alerta_averia = alerta
     print(f"\n[{ws_id} - ALERTA] {motivo}")
-    avisar_central(ws_id, "ALERT#FUGA")
+    avisar_central(ws_id, alerta)
 
 
 #Si veníamos de una avería y el engine vuelve a decir OK, avisamos a Central
@@ -102,20 +109,20 @@ def health_pulse_worker(engine_socket, ws_id):
             engine_socket.sendall(b"HEALTH?")
             respuesta = engine_socket.recv(1024)
         except socket.timeout: #ya no pregunta
-            reportar_averia(ws_id, f"El Engine no responde en {TIMEOUT_PULSO}s.")
+            reportar_averia(ws_id, f"El Engine no responde en {TIMEOUT_PULSO}s.", "ALERT#ENGINE_CAIDO")
             break
         except OSError as e:
-            reportar_averia(ws_id, f"Conexión con el Engine perdida ({e}).") #ya no pregunta
+            reportar_averia(ws_id, f"Conexión con el Engine perdida ({e}).", "ALERT#ENGINE_CAIDO") #ya no pregunta
             break
 
         if respuesta == b"OK": #sigue preguntando, pero no enviando ok
             reportar_resuelta(ws_id)
             continue
         if respuesta == b"KO": #sigue preguntando, pero no enviando ko
-            reportar_averia(ws_id, "¡El Engine ha respondido KO (avería/fuga)!")
+            reportar_averia(ws_id, "¡El Engine ha respondido KO (avería/fuga)!", "ALERT#FUGA")
             continue
         if not respuesta:
-            reportar_averia(ws_id, "El Engine ha cerrado la conexión.")
+            reportar_averia(ws_id, "El Engine ha cerrado la conexión.", "ALERT#ENGINE_CAIDO")
             break
         print(f"[{ws_id} - SALUD] Respuesta desconocida del Engine: {respuesta}") #si pasa cualquier otra cosa, alguien se conecta al mismo puerto
 
@@ -223,7 +230,7 @@ def mantener_conexion_central(central_ip, central_port, ws_id, ubicacion):
         if estacion_averiada:
             #Al registrarnos Central nos pone en DISPONIBLE, pero si la avería
             #sigue hay que volver a avisarle para que nos ponga en rojo
-            avisar_central(ws_id, "ALERT#FUGA") #no se envia reportar_averia porque ya está en true estacion_Averiada
+            avisar_central(ws_id, alerta_averia) #no se envia reportar_averia porque ya está en true estacion_Averiada
 
         #Escuchamos lo que nos manda Central. Mientras esté viva, recv espera;
         #si se cae, recv devuelve b"" o da error y salimos del bucle

@@ -107,14 +107,22 @@ def procesar_trama_monitor(ws_id, texto, ip="-"):
     if texto == "PING":
         return   # solo sirve para saber que el monitor sigue vivo
 
-    if texto == "ALERT#FUGA":
-        if get_estado_estacion(ws_id) == "FUERA DE SERVICIO":
-            bloqueadas_con_averia.add(ws_id)   # nos acordamos de que estaba bloqueada
+    # Las dos averías ponen la estación en AVERIADA (rojo); solo cambia qué se
+    # registra en la auditoría:
+    #   ALERT#FUGA         -> el engine contesta KO
+    #   ALERT#ENGINE_CAIDO -> el engine no contesta o se ha desconectado del monitor
+    if texto in ("ALERT#FUGA", "ALERT#ENGINE_CAIDO"):
         estado_antes = get_estado_estacion(ws_id)
+        if estado_antes == "FUERA DE SERVICIO":
+            bloqueadas_con_averia.add(ws_id)   # nos acordamos de que estaba bloqueada
         actualizar_estado_estacion(ws_id, "AVERIADA")
-        print(f"\n[ALERTA CRÍTICA] ¡Avería/Fuga detectada en {ws_id}! -> Estado en BD: AVERIADA\n")
-        auditar("FUGA", f"Fuga detectada en {ws_id}", nivel="ERROR", quien=ws_id, ip=ip,
-                datos={"estado_anterior": estado_antes, "estado_nuevo": "AVERIADA"})
+        datos = {"estado_anterior": estado_antes, "estado_nuevo": "AVERIADA"}
+        if texto == "ALERT#FUGA":
+            print(f"\n[ALERTA CRÍTICA] ¡Avería/Fuga detectada en {ws_id}! -> Estado en BD: AVERIADA\n")
+            auditar("FUGA", f"Fuga detectada en {ws_id}", nivel="ERROR", quien=ws_id, ip=ip, datos=datos)
+        else:
+            print(f"\n[ALERTA CRÍTICA] ¡El Engine de {ws_id} se ha caído! -> Estado en BD: AVERIADA\n")
+            auditar("ENGINE_CAIDO", f"El Engine de {ws_id} se ha caído", nivel="ERROR", quien=ws_id, ip=ip, datos=datos)
 
     elif texto == "ALERT#RESUELTA":
         estado = get_estado_estacion(ws_id)
@@ -127,7 +135,7 @@ def procesar_trama_monitor(ws_id, texto, ip="-"):
                 nuevo = "DISPONIBLE"
             actualizar_estado_estacion(ws_id, nuevo)
             print(f"\n[CENTRAL] Avería resuelta en {ws_id} -> Estado en BD: {nuevo}\n")
-            auditar("FUGA_RESUELTA", f"Fuga resuelta en {ws_id}", quien=ws_id, ip=ip,
+            auditar("FUGA_RESUELTA", f"Avería resuelta en {ws_id}", quien=ws_id, ip=ip,
                     datos={"estado_anterior": "AVERIADA", "estado_nuevo": nuevo})
         else:
             print(f"[CENTRAL] {ws_id} avisa de avería resuelta, pero está en {estado}: no se cambia.")
