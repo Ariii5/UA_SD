@@ -1,3 +1,4 @@
 kafka-python==2.2.15
 prompt_toolkit
 cryptography
+requests
