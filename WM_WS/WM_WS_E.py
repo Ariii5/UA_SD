@@ -7,6 +7,7 @@
 #     segundo publica el caudal y los litros que lleva
 #   - Cierra cuando se acaba el tiempo, cuando Central manda CERRAR,
 #     al pulsar una tecla o si se cierra el programa
+#   - Avisa por su terminal si el operario del riego en curso deja de dar señales
 #
 #  Teclas: k = avería | o = reparar | a <seg> = riego manual | p = parar
 #
@@ -32,10 +33,12 @@ monitor_conectado = False   # sin monitor la estación está averiada y no riega
 # Topics de Kafka
 TOPIC_TELEMETRIA = "wm_telemetria"   # Engine -> Central y operarios
 TOPIC_ORDENES = "wm_ordenes"         # Central -> Engine (ABRIR, CERRAR)
-TOPIC_SOLICITUDES = "wm_solicitudes" # Engine -> Central (riego manual desde la estación)
+TOPIC_SOLICITUDES = "wm_solicitudes" # Engine -> Central (riego manual desde la estación). También llega el LATIDO_FO de los operarios
 TOPIC_RESPUESTAS = "wm_respuestas"   # Central -> quien pidió el riego (y el LATIDO)
 
 MAX_ANTIGUEDAD_ORDEN = 4    # las órdenes con más de 4 s se ignoran
+TIMEOUT_FO = 6              #segundos sin latido del operario para avisar de que ha caído
+latidos_fo = {}             #última vez que llegó el latido de cada operario: {"FO-01": hora}
 desfase_central = 0.0       # segundos que nuestro reloj va por delante del de Central (se calcula con su LATIDO)
 producer = None             # productor de Kafka, se crea en el main
 ws_id = None                # nuestro ID, nos lo dice el monitor al conectarnos
@@ -245,7 +248,7 @@ def escuchar_ordenes(broker):
         metadata_max_age_ms=3000,        # refresca la información de Kafka cada 3 s
         value_deserializer=lambda b: json.loads(b.decode("utf-8")),
     )
-    consumer.subscribe([TOPIC_ORDENES, TOPIC_RESPUESTAS]) #las ordenes de la central | el latido de central y la respuesta a los riegos manueales
+    consumer.subscribe([TOPIC_ORDENES, TOPIC_RESPUESTAS, TOPIC_SOLICITUDES]) #las ordenes de la central | el latido de central y la respuesta a los riegos manueales | el latido de los operarios
     # Al arrancar saltamos al final de los topics: no queremos abrir la
     # válvula por un ABRIR que se quedó en Kafka mientras estábamos apagados
     limite = time.time() + 30
@@ -261,6 +264,11 @@ def escuchar_ordenes(broker):
         for registros in lotes.values():
             for msg in registros:
                 orden = msg.value
+                if msg.topic == TOPIC_SOLICITUDES:
+                    #de aquí solo nos interesa el latido de los operarios
+                    if orden.get("tipo") == "LATIDO_FO":
+                        latidos_fo[orden.get("op_id")] = time.time()
+                    continue
                 if msg.topic == TOPIC_RESPUESTAS:
                     if orden.get("tipo") == "LATIDO":
                         ultimo_latido = time.time()
@@ -293,6 +301,30 @@ def vigilar_central():
         elif caida:
             print("\n[ENGINE]  WM_Central vuelve a estar disponible.")
             caida = False
+
+
+#Hilo que avisa si el operario del riego en curso deja de mandar su latido.
+#Solo lo enseña por pantalla: el riego sigue igual
+def vigilar_fo():
+    avisado = None   #operario del que ya hemos avisado
+    while True:
+        time.sleep(1)
+        with lock:
+            op = riego["op_id"] if riego["valvula_abierta"] else None
+            inicio = riego["inicio"]
+        #los riegos de Central y los manuales no tienen operario que vigilar
+        if not op or op == "CENTRAL" or op.startswith("MANUAL-"):
+            avisado = None
+            continue
+        #si todavía no ha llegado ningún latido contamos desde que se abrió la válvula
+        ultimo = max(latidos_fo.get(op, 0), inicio)
+        if time.time() - ultimo > TIMEOUT_FO:
+            if avisado != op:
+                print(f"\n[ENGINE] X El operario {op} no da señales de vida. El riego continúa.")
+                avisado = op
+        elif avisado == op:
+            print(f"\n[ENGINE]  El operario {op} vuelve a estar disponible.")
+            avisado = None
 
 
 def procesar_orden(orden):
@@ -408,6 +440,7 @@ if __name__ == "__main__":
         threading.Thread(target=escuchar_ordenes, args=(broker,), daemon=True).start()
         ultimo_latido = time.time()
         threading.Thread(target=vigilar_central, daemon=True).start()
+        threading.Thread(target=vigilar_fo, daemon=True).start()
 
         # A partir de aquí, cerrar la ventana cierra la válvula de forma ordenada
         instalar_cierre_ventana()
