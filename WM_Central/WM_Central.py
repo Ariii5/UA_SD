@@ -362,6 +362,11 @@ pendientes = {}
 # Riegos en marcha: {ws_id: {req_id, op_id, caudal, volumen, transcurrido, ultimo, sol}}
 activos = {}
 
+TIMEOUT_FO = 6   #segundos sin LATIDO_FO para dar un operario por caído
+#Operarios que mandan su latido: {op_id: {"ultimo": hora, "ip": ip, "caido": True/False}}
+lock_operarios = threading.Lock()
+operarios_vivos = {}
+
 
 # Publica un mensaje en Kafka con la hora y espera a que salga
 def enviar(topic, mensaje, clave):
@@ -422,6 +427,25 @@ def procesar_solicitud(sol):
 
 
 # El operario quiere ver todas las estaciones y su estado
+#Un operario que acaba de arrancar pregunta si tiene riegos en marcha,
+#para volver a enseñar su telemetría
+def procesar_mis_riegos(sol):
+    with lock_riegos:
+        riegos = [{"ws_id": ws, "req_id": a["req_id"]} for ws, a in activos.items()
+                  if a["op_id"] == sol.get("op_id")]
+    responder_operario("EN_CURSO", sol, f"{len(riegos)} riego(s) en marcha", riegos=riegos)
+
+
+#Latido de un operario: así sabemos qué operarios están conectados
+def latido_operario(m):
+    op_id = m.get("op_id")
+    with lock_operarios:
+        anterior = operarios_vivos.get(op_id)
+        operarios_vivos[op_id] = {"ultimo": time.time(), "ip": m.get("ip", "-"), "caido": False}
+    if anterior is None or anterior["caido"]:
+        auditar("FO_CONECTADO", f"El operario {op_id} está conectado", quien=op_id, ip=m.get("ip", "-"))
+
+
 def procesar_listado(sol):
     estaciones = [{"ws_id": e[0], "ubicacion": e[1], "estado": e[2]} for e in get_estaciones()]
     responder_operario("LISTADO", sol, "Estado de las estaciones", estaciones=estaciones)
@@ -581,6 +605,14 @@ def vigilar_timeouts():
                 responder_operario("RESUMEN", a["sol"], f"Sin noticias de {ws}: riego dado por terminado",
                                    motivo="SIN_NOTICIAS_ESTACION",
                                    duracion=a["transcurrido"], litros=a["volumen"])
+            #Operarios que han dejado de mandar su latido (se avisa una sola vez)
+            with lock_operarios:
+                caidos = [(op, o["ip"]) for op, o in operarios_vivos.items()
+                          if not o["caido"] and ahora - o["ultimo"] > TIMEOUT_FO]
+                for op, _ in caidos:
+                    operarios_vivos[op]["caido"] = True
+            for op, ip in caidos:
+                auditar("FO_CAIDO", f"El operario {op} no da señales de vida", nivel="AVISO", quien=op, ip=ip)
         except Exception as e:
             # Si Kafka está caído, enviar() da error. Con el try el hilo sigue
             # vivo y lo vuelve a intentar en la siguiente vuelta
@@ -647,6 +679,10 @@ def bucle_kafka(broker):
                             procesar_solicitud(m)
                         elif m.get("tipo") == "LISTAR":
                             procesar_listado(m)
+                        elif m.get("tipo") == "MIS_RIEGOS":
+                            procesar_mis_riegos(m)
+                        elif m.get("tipo") == "LATIDO_FO":
+                            latido_operario(m)
                     else:
                         procesar_evento_ws(m)
                 except Exception as e:   # un mensaje mal formado no puede tirar Central
@@ -1538,10 +1574,60 @@ setInterval(refrescarEventos, 1000);
 """
 
 
+# ============================================================
+#  API_CENTRAL (consultas)
+#  API REST para el Front. Va en el mismo servidor web que el panel (mismo
+#  hilo y mismo puerto), así en Railway no hace falta otro puerto.
+#    GET /estaciones          todas las estaciones
+#    GET /estaciones/{id}     una estación (404 si no existe)
+#    GET /operarios           operarios, si están conectados, su IP y sus riegos
+#    GET /riegos              riegos en curso
+#    GET /eventos?desde=N     eventos de la auditoría con seq mayor que N
+# ============================================================
+
+def api_estaciones():
+    telemetria = obtener_telemetria()
+    litros_totales = get_litros_totales()
+    registradas = get_registradas()
+    with lock_monitores:
+        conectadas = set(monitores_conectados)
+    return [{"id": ws_id, "ubicacion": ubicacion, "estado": estado,
+             "registrada": ws_id in registradas, "autenticada": ws_id in conectadas,
+             "litros_totales": round(float(litros_totales.get(ws_id) or 0.0), 2),
+             "riego": telemetria.get(ws_id)}
+            for ws_id, ubicacion, estado in get_estaciones()]
+
+
+def api_operarios():
+    ahora = time.time()
+    with lock_riegos:
+        riegos_de = {}
+        for ws, a in activos.items():
+            riegos_de.setdefault(a["op_id"], []).append(ws)
+    with lock_operarios:
+        vivos = dict(operarios_vivos)
+    resultado = []
+    for op_id, nombre in get_operarios():
+        o = vivos.get(op_id)
+        resultado.append({"id": op_id, "nombre": nombre,
+                          "conectado": bool(o) and ahora - o["ultimo"] <= TIMEOUT_FO,
+                          "ip": o["ip"] if o else None,
+                          "riegos": riegos_de.get(op_id, [])})
+    return resultado
+
+
+def api_riegos():
+    with lock_riegos:
+        return [{"ws_id": ws, "op_id": a["op_id"], "req_id": a["req_id"], "caudal": a["caudal"],
+                 "volumen": a["volumen"], "transcurrido": a["transcurrido"]}
+                for ws, a in activos.items()]
+
+
 # Atiende las peticiones del navegador:
 #   GET  /             -> la página
 #   GET  /api/estado   -> el estado en JSON
 #   GET  /api/eventos?desde=N -> los eventos de la auditoría con seq mayor que N
+#   GET  /estaciones, /operarios, /riegos, /eventos -> API_Central (ver arriba)
 #   POST /api/comando  -> ejecutar un botón
 #   /registry/...      -> el Registry (WM_Registry.py). Va antes de la contraseña
 #                         del panel: lo usan los monitores, no las personas
@@ -1574,8 +1660,22 @@ class ManejadorPanelWeb(http.server.BaseHTTPRequestHandler):
         self.send_header("Content-Type", tipo)
         self.send_header("Content-Length", str(len(datos)))
         self.send_header("Cache-Control", "no-store")
+        #CORS: el Front está en otra dirección y sin esto el navegador bloquea sus peticiones
+        self.send_header("Access-Control-Allow-Origin", "*")
         self.end_headers()
         self.wfile.write(datos)
+
+    def _json(self, codigo, datos):
+        self._responder(codigo, "application/json", json.dumps(datos, ensure_ascii=False, default=str))
+
+    #Antes de un POST, PUT o DELETE desde otra web, el navegador pregunta con
+    #OPTIONS si puede. Se contesta sin pedir contraseña
+    def do_OPTIONS(self):
+        self.send_response(204)
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
+        self.send_header("Access-Control-Allow-Headers", "Content-Type, Authorization")
+        self.end_headers()
 
     def do_GET(self):
         if WM_Registry.es_ruta_registry(self.path):
@@ -1602,6 +1702,31 @@ class ManejadorPanelWeb(http.server.BaseHTTPRequestHandler):
             ultimo = lista[-1]["seq"] if lista else ultimo_seq_auditoria()
             self._responder(200, "application/json", json.dumps({"eventos": lista, "ultimo": ultimo},
                                                                  ensure_ascii=False, default=str))
+        else:
+            self._api_get()
+
+    #Rutas GET de API_Central. "/estaciones/WS-01?x=1" -> partes ["estaciones", "WS-01"]
+    def _api_get(self):
+        url = urllib.parse.urlparse(self.path)
+        partes = [p for p in url.path.split("/") if p]
+        if partes == ["estaciones"]:
+            self._json(200, api_estaciones())
+        elif len(partes) == 2 and partes[0] == "estaciones":
+            una = [e for e in api_estaciones() if e["id"] == partes[1].upper()]
+            if una:
+                self._json(200, una[0])
+            else:
+                self._json(404, {"error": f"La estación {partes[1]} no existe"})
+        elif partes == ["operarios"]:
+            self._json(200, api_operarios())
+        elif partes == ["riegos"]:
+            self._json(200, api_riegos())
+        elif partes == ["eventos"]:
+            try:
+                desde = int(urllib.parse.parse_qs(url.query).get("desde", ["0"])[0])
+            except ValueError:
+                desde = 0
+            self._json(200, obtener_eventos(desde))
         else:
             self._responder(404, "text/plain; charset=utf-8", "No encontrado")
 
