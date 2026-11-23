@@ -6,6 +6,9 @@
 #   - lee las respuestas de Central en wm_respuestas
 #   - la telemetría de su riego también le llega por wm_respuestas: el
 #     Engine se la manda a Central y Central se la reenvía
+#   - cada 2 s manda su LATIDO_FO para que Central y el Engine sepan que sigue vivo
+#   - al arrancar pregunta a Central si tiene un riego en marcha y, si lo
+#     tiene, vuelve a enseñar su telemetría
 #
 #  Tiene dos modos:
 #   - Interactivo: menú para pedir riegos y ver las estaciones
@@ -42,6 +45,7 @@ TOPIC_RESPUESTAS = "wm_respuestas"     # Central -> FO (respuestas, telemetría 
 ESPERA_ENTRE_SERVICIOS = 4      # segundos entre peticiones en el modo fichero
 TIMEOUT_RESPUESTA = 15          # si Central no contesta en 15 s, damos la petición por perdida
 TIMEOUT_TELEMETRIA = 10         # si durante un riego no llega telemetría en 10 s, lo damos por perdido
+LATIDO_FO = 2                   #cada cuántos segundos mandamos nuestro latido
 
 op_id = None        # nuestro ID (FO-01...), se pone al arrancar
 producer = None     # productor de Kafka, se crea al arrancar
@@ -164,6 +168,18 @@ def obtener_ip():
         return "127.0.0.1"
 
 
+#Hilo que cada 2 s manda nuestro latido. Lo usan Central (para saber qué
+#operarios están conectados) y el Engine (para avisar si el operario de su riego muere)
+def enviar_latidos():
+    while True:
+        try:
+            producer.send(TOPIC_SOLICITUDES, key=op_id,
+                          value={"tipo": "LATIDO_FO", "op_id": op_id, "ip": mi_ip, "ts": time.time()})
+        except Exception:
+            pass #si Kafka está caído no pasa nada, se vuelve a intentar en 2 s
+        time.sleep(LATIDO_FO)
+
+
 #Manda una petición a Central. Devuelve False si Kafka no responde
 def enviar(mensaje):
     mensaje["ts"] = time.time()
@@ -201,8 +217,14 @@ def solicitar_riego(ws_id, duracion):
                    "ws_id": ws_id, "duracion": duracion}):
         riego_activo.update(req_id=None, ws_id=None) #esta caido kafka
         return False
+    return esperar_riego(req_id, ws_id)
 
-    autorizado = False
+
+#Espera los mensajes de un riego y los enseña hasta el RESUMEN. La usa
+#solicitar_riego y también recuperar_riegos, al volver a arrancar el FO
+#con un riego todavía en marcha (entonces ya viene autorizado)
+def esperar_riego(req_id, ws_id, autorizado=False):
+    riego_activo.update(req_id=req_id, ws_id=ws_id)
     try:
         while True:
             #Antes de autorizar esperamos 15 s; durante el riego, 10 s entre mensajes telemetría
@@ -272,6 +294,35 @@ def listar_estaciones():
         print(f"[FO {op_id}] X Imposible conectar con WM_Central.") #para el break
     finally:
         riego_activo.update(req_id=None, ws_id=None)
+
+
+#Al arrancar le preguntamos a Central si tenemos algún riego en marcha
+#(por ejemplo, porque el FO se cerró a mitad). Si lo hay, volvemos a
+#enseñar su telemetría hasta que termine
+def recuperar_riegos():
+    req_id = f"{op_id}-{uuid.uuid4().hex[:8]}"
+    vaciar_bandeja()
+    riego_activo.update(req_id=req_id, ws_id=None)
+    respuesta = None
+    try:
+        if not enviar({"tipo": "MIS_RIEGOS", "req_id": req_id, "op_id": op_id}):
+            return
+        limite = time.time() + 5
+        while time.time() < limite and respuesta is None:
+            try:
+                m = bandeja.get(timeout=limite - time.time())
+            except queue.Empty:
+                break
+            if m.get("tipo") == "EN_CURSO" and m.get("req_id") == req_id:
+                respuesta = m
+    finally:
+        riego_activo.update(req_id=None, ws_id=None)
+    if respuesta is None:
+        return
+    for r in respuesta.get("riegos", []):
+        print(f"\n[FO {op_id}] Tienes un riego en marcha en {r['ws_id']} ({r['req_id']}). Recuperando su telemetría...")
+        ok = esperar_riego(r["req_id"], r["ws_id"], autorizado=True)
+        print(f"[FO {op_id}] Riego recuperado {'COMPLETADO' if ok else 'FALLIDO'}.")
 
 
 #Lee el fichero de peticiones y devuelve [(ws_id, duracion), ...].
@@ -379,13 +430,16 @@ def iniciar_operario():
         print(f"X No hay broker Kafka disponible en {args.broker}")
         sys.exit(1)
 
-    # Hilos en segundo plano: uno lee de Kafka y otro vigila el latido de Central
+    # Hilos en segundo plano: uno lee de Kafka, otro vigila el latido de Central
+    #y otro manda el nuestro
     threading.Thread(target=hilo_consumidor, args=(consumer,), daemon=True).start()
     ultimo_latido = time.time()
     threading.Thread(target=vigilar_central, daemon=True).start()
+    threading.Thread(target=enviar_latidos, daemon=True).start()
     time.sleep(2)
 
     try:
+        recuperar_riegos()
         if args.fichero:
             modo_fichero(args.fichero)
         else:
